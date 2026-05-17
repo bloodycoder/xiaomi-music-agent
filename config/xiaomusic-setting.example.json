@@ -1,0 +1,19 @@
+{
+  "account": "",
+  "password": "",
+  "hostname": "http://YOUR_MAC_LAN_IP",
+  "mi_did": "YOUR_XIAOMI_DEVICE_DID",
+  "port": 8090,
+  "enable_pull_ask": true,
+  "pull_ask_sec": 1,
+  "disable_httpauth": true,
+  "user_key_word_dict": {
+    "智能播放": "exec#smartplay(\"{arg}\")",
+    "智能音乐": "exec#smartplay(\"{arg}\")",
+    "智能下一首": "exec#smartnext()",
+    "智能上一首": "exec#smartprev()",
+    "智能暂停": "exec#smartpause()",
+    "智能问": "exec#smartask(\"{arg}\")"
+  },
+  "active_cmd": "智能播放,智能音乐,智能下一首,智能上一首,智能暂停,智能问"
+}

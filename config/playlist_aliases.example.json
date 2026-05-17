@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "generated_at": "example",
+  "note": "Editable weighted alias table. Higher weight wins. Music Agent normalizes punctuation/case.",
+  "playlists": [
+    {
+      "id": "123456",
+      "name": "睡觉歌单",
+      "count": 20,
+      "creator": "your-name",
+      "is_mine": true,
+      "aliases": [
+        { "text": "睡觉", "weight": 900, "reason": "manual alias" },
+        { "text": "助眠", "weight": 850, "reason": "manual alias" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+diff --git a/xiaomusic/command_handler.py b/xiaomusic/command_handler.py
+--- a/xiaomusic/command_handler.py
++++ b/xiaomusic/command_handler.py
+@@
+-import asyncio
+-import re
++import asyncio
++import json
++import re
+@@
+             # 自定义口令
+             if opvalue.startswith("exec#"):
+                 code = opvalue.split("#", 1)[1]
++                # Allow custom commands to forward the text after the matched
++                # keyword, e.g. exec#smartplay("{arg}"). json.dumps keeps the
++                # generated Python string valid if the song/playlist name has quotes.
++                if "{arg}" in code:
++                    code = code.replace("{arg}", json.dumps(oparg, ensure_ascii=False)[1:-1])
+                 return "exec", code

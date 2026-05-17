@@ -1,0 +1,22 @@
+{
+  "name": "netease-music-mcp",
+  "version": "1.0.0",
+  "description": "MCP server to control NeteaseMusic on macOS via Chrome DevTools Protocol",
+  "main": "server.js",
+  "bin": {
+    "netease-music-mcp": "./server.js",
+    "netease-music-cli": "./music.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node music.js"
+  },
+  "keywords": ["mcp", "netease", "music", "neteasemusic", "cdp", "macos"],
+  "author": "Nicole & Claude",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.20.0",
+    "zod": "^3.24.4"
+  }
+}
