@@ -159,6 +159,18 @@ bash scripts/security_check.sh
 
 更多见：[`docs/SECURITY.md`](docs/SECURITY.md)
 
+
+## Third-Party Projects & Attribution
+
+This project references third-party projects/products.
+
+- **xiaomusic**: https://github.com/hanxi/xiaomusic (license and copyright belong to upstream).
+- **cloud-music-mcp** (optional local integration): follow upstream repository license/terms.
+- **MCP ecosystem packages**: follow each package license.
+- **Netease Music Desktop App**: proprietary product, not redistributed here.
+
+Please review [`NOTICE`](NOTICE) and [`docs/LEGAL.md`](docs/LEGAL.md) before redistribution/commercial use.
+
 ## Troubleshooting
 
 ### Netease CDP 不可用
@@ -182,4 +194,4 @@ curl --noproxy '*' http://127.0.0.1:9222/json/version
 
 ## License
 
-MIT. xiaomusic、NeteaseMusic、cloud-music-mcp 等第三方项目遵循其各自许可证。
+MIT applies to this repository's original code only. Third-party projects and products (xiaomusic, cloud-music-mcp, NeteaseMusic, MCP dependencies) follow their own licenses/terms. See NOTICE and docs/LEGAL.md.

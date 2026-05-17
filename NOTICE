@@ -1,0 +1,38 @@
+Xiaomi Music Agent - Third-Party Notices
+
+This repository contains original integration/automation code and configuration
+examples. It references third-party projects and products listed below.
+
+Important:
+- The MIT license in this repository applies ONLY to original code contained
+  in this repository, unless otherwise noted.
+- Third-party components remain under their own licenses and terms.
+- This repository does NOT redistribute Netease Music Desktop App.
+
+Third-party dependencies / integrations:
+
+1) xiaomusic
+   - Upstream: https://github.com/hanxi/xiaomusic
+   - Role here: XiaoAI command capture + plugin execution
+   - License: see upstream repository
+
+2) cloud-music-mcp (when used locally)
+   - Upstream: please use the original upstream repository URL in your deployment
+   - Role here: optional Netease account/session playlist metadata access
+   - License: see upstream repository
+
+3) Model Context Protocol ecosystem packages (when used)
+   - Upstream org: https://github.com/modelcontextprotocol
+   - Role here: local MCP integrations
+   - License: see each package license
+
+4) Netease Music Desktop App (proprietary product)
+   - Vendor: NetEase
+   - Role here: local playback endpoint controlled via local automation/CDP
+   - Redistribution: not included in this repository
+   - You must comply with vendor terms and applicable local laws.
+
+Trademark notice:
+- Xiaomi, XiaoAI, Netease/网易云音乐 and related marks belong to their
+  respective owners. This project is an independent community integration and
+  is not endorsed by those trademark owners.
