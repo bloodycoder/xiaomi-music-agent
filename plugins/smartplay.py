@@ -5,6 +5,8 @@ import requests
 MUSIC_AGENT_URL = os.environ.get('MUSIC_AGENT_URL', 'http://127.0.0.1:8765').rstrip('/')
 
 
+DEFAULT_EMPTY_QUERY = os.environ.get('SMARTPLAY_DEFAULT_QUERY', 'kkecho歌单')
+
 _suppress_tasks = set()
 
 
@@ -57,9 +59,10 @@ async def smartplay(query):
     _suppress_tasks.add(task)
     task.add_done_callback(_suppress_tasks.discard)
 
-    if not q:
-        log.warning('smartplay empty query')
-        return
+    if (not q) or q == '{arg}':
+        old_q = q
+        q = DEFAULT_EMPTY_QUERY
+        log.warning(f'smartplay empty/literal query:{old_q!r}, fallback to default:{q}')
 
     try:
         # requests 是同步库，放到线程里，避免阻塞 xiaomusic 事件循环和后台打断任务。

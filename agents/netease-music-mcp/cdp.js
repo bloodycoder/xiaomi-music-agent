@@ -55,6 +55,65 @@ async function withCDP(fn) {
   }
 }
 
+async function clearQueue() {
+  return withCDP(async (evalJS) => {
+    const result = await evalJS(`
+      (async () => {
+        function visible(el) {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          const st = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+        }
+        function textOf(el) {
+          return (el.innerText || el.textContent || el.title || el.getAttribute('aria-label') || '').trim();
+        }
+        async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        // Open the native play-queue popover/panel if it is not already open.
+        let bodyText = document.body.innerText || '';
+        if (!/播放列表[\s\S]{0,200}清空/.test(bodyText)) {
+          const footer = document.querySelector('footer');
+          const queueBtn = footer && Array.from(footer.querySelectorAll('button, [role=button], [class*=queue], [class*=list], [class*=playlist], [class*=songlist]')).find(el => {
+            const t = textOf(el);
+            const cls = String(el.className || '');
+            return visible(el) && (/播放列表|队列|列表|queue|playlist|songlist/i.test(t + ' ' + cls));
+          });
+          if (queueBtn) {
+            (queueBtn.closest('button') || queueBtn).click();
+            await sleep(500);
+          }
+        }
+
+        const before = (document.body.innerText || '').slice(0, 1200);
+        const clearEl = Array.from(document.querySelectorAll('button, [role=button], a, span, div')).find(el => {
+          if (!visible(el) || el.closest('footer')) return false;
+          const t = textOf(el);
+          return /^清空$|清空列表|清除列表|Clear/i.test(t);
+        });
+        if (!clearEl) {
+          // If no visible clear button exists, do not fail playback. Native queue may
+          // be closed/empty, or the app UI changed.
+          return JSON.stringify({success:false, skipped:true, error:'clear button not found', pageText:before});
+        }
+        (clearEl.closest('button') || clearEl).click();
+        await sleep(300);
+        const confirmEl = Array.from(document.querySelectorAll('button, [role=button]')).find(el => {
+          if (!visible(el)) return false;
+          const t = textOf(el);
+          return /^确定$|确认|清空|删除|OK/i.test(t);
+        });
+        if (confirmEl && !confirmEl.closest('footer')) {
+          (confirmEl.closest('button') || confirmEl).click();
+          await sleep(300);
+        }
+        return JSON.stringify({success:true, clicked:textOf(clearEl), pageText:before});
+      })()
+    `, 6000);
+    return JSON.parse(result);
+  });
+}
+
 async function playSong(query) {
   return withCDP(async (evalJS) => {
     await evalJS(`
@@ -196,18 +255,28 @@ async function clickFooterButton(iconClass) {
   return withCDP(async (evalJS) => {
     const result = await evalJS(`
       (function() {
-        var btn = document.querySelector('footer .cmd-icon-${iconClass}');
-        if (!btn) return JSON.stringify({success: false, error: '${iconClass} button not found'});
-        var button = btn.closest('button') || btn;
+        function visible(el) {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          const st = getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+        }
+        var icon = Array.from(document.querySelectorAll('footer .cmd-icon')).find(el => el.classList.contains('cmd-icon-${iconClass}') && visible(el));
+        if (!icon) return JSON.stringify({success: false, error: '${iconClass} button not found'});
+        var button = icon.closest('button') || icon;
         button.click();
-        return JSON.stringify({success: true, action: '${iconClass}'});
+        return JSON.stringify({success: true, action: '${iconClass}', text: icon.textContent || icon.title || ''});
       })()
     `);
     return JSON.parse(result);
   });
 }
 
-async function togglePlay() { return clickFooterButton('play').catch(() => clickFooterButton('pause')); }
+async function togglePlay() {
+  const play = await clickFooterButton('play').catch(e => ({success:false, error:e.message}));
+  if (play && play.success) return play;
+  return clickFooterButton('pause');
+}
 async function nextTrack() { return clickFooterButton('next'); }
 async function prevTrack() { return clickFooterButton('pre'); }
 
@@ -242,4 +311,4 @@ async function getStatus() {
   });
 }
 
-module.exports = { playSong, playPlaylist, setShuffleMode, togglePlay, nextTrack, prevTrack, getStatus };
+module.exports = { playSong, playPlaylist, clearQueue, setShuffleMode, togglePlay, nextTrack, prevTrack, getStatus };

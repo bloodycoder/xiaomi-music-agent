@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { playSong, playPlaylist, togglePlay, nextTrack, prevTrack, getStatus } = require('./cdp');
+const { playSong, playPlaylist, clearQueue, togglePlay, nextTrack, prevTrack, getStatus } = require('./cdp');
 
 const [,, action, ...args] = process.argv;
 const run = (fn) => fn().then(r => console.log(JSON.stringify(r))).catch(e => { console.error(`Error: ${e.message}`); process.exit(1); });
@@ -23,10 +23,11 @@ switch (action) {
       console.error('Usage: node music.js playlist <playlist_id>'); process.exit(1);
     }
     break;
+  case 'clear': run(clearQueue); break;
   case 'pause': run(togglePlay); break;
   case 'next': run(nextTrack); break;
   case 'prev': run(prevTrack); break;
   case 'status': run(getStatus); break;
   default:
-    console.log('Usage: node music.js <play [query]|playlist <id>|pause|next|prev|status>');
+    console.log('Usage: node music.js <play [query]|playlist <id>|clear|pause|next|prev|status>');
 }
