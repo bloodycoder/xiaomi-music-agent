@@ -1,0 +1,14 @@
+[package]
+name = "ter-agent-player"
+version = "0.1.0"
+edition = "2021"
+description = "Headless playlist player daemon for Xiaomi Music Agent"
+license = "MIT"
+
+[dependencies]
+rodio = "0.19"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+urlencoding = "2.1"
+rand = "0.8"

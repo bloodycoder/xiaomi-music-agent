@@ -7,6 +7,7 @@ import base64
 import os
 import re
 import time
+import sys
 import threading
 import difflib
 import random
@@ -20,13 +21,13 @@ NETEASE_DIR = ROOT / 'agents' / 'netease-music-mcp'
 CLOUD_MCP_DIR = ROOT / 'agents' / 'cloud-music-mcp'
 PLAYLISTS_FILE = ROOT / 'runtime' / 'playlists.json'
 ALIASES_FILE = ROOT / 'runtime' / 'playlist_aliases.json'
-QUEUE_FILE = ROOT / 'runtime' / 'active_playlist_queue.json'
 CACHE_TRACKS_FILE = ROOT / 'runtime' / 'playlist_tracks_cache.json'
 CACHE_URL_FILE = ROOT / 'runtime' / 'song_url_cache.json'
 ARTIST_INDEX_FILE = ROOT / 'runtime' / 'playlist_artist_index.json'
 EMBEDDINGS_FILE = ROOT / 'runtime' / 'playlist_embeddings.json'
 ENV_FILE = ROOT / '.env.local'
 YESPLAY_AGENT_DEFAULT_URL = 'http://127.0.0.1:27232/agent'
+MUSIC_AGENT_URL = os.environ.get('MUSIC_AGENT_URL') or f"http://127.0.0.1:{os.environ.get('MUSIC_AGENT_PORT', '8765')}"
 CACHE_TRACKS_TTL = 86400
 # Netease direct audio URLs are signed and can expire quickly. Keep only a
 # short cache; stale URLs cause ffplay HTTP 403 and silent playback failure.
@@ -36,6 +37,201 @@ AUDIO_SWITCH_COOLDOWN = 1800
 _last_audio_switch_time = 0
 _last_audio_switch_device = ''
 _embedding_disabled_until = 0
+
+# Hot-path caches.  Voice commands are latency sensitive; repeatedly parsing
+# the same runtime JSON files and respawning Python just to hit pyncm adds
+# avoidable overhead.  These caches are mtime/size guarded, so external edits to
+# the cache files are still picked up without changing any matching semantics.
+_json_file_cache = {}
+_json_file_cache_lock = threading.Lock()
+_env_cache = {'mtime': None, 'size': None, 'data': None}
+_netease_worker = None
+_netease_worker_lock = threading.Lock()
+_netease_worker_io_lock = threading.Lock()
+_semantic_mapper_warm = False
+_semantic_mapper_warm_lock = threading.Lock()
+
+
+def _load_json_cached(path, default=None):
+    path = Path(path)
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return default
+    key = str(path)
+    with _json_file_cache_lock:
+        hit = _json_file_cache.get(key)
+        if hit and hit.get('mtime') == st.st_mtime and hit.get('size') == st.st_size:
+            return hit.get('data')
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return default
+    with _json_file_cache_lock:
+        _json_file_cache[key] = {'mtime': st.st_mtime, 'size': st.st_size, 'data': data}
+    return data
+
+
+def _save_json_cached(path, data, **json_kwargs):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, **json_kwargs))
+    try:
+        st = path.stat()
+        with _json_file_cache_lock:
+            _json_file_cache[str(path)] = {'mtime': st.st_mtime, 'size': st.st_size, 'data': data}
+    except Exception:
+        pass
+
+
+def _cloud_music_python():
+    venv = CLOUD_MCP_DIR / '.venv' / 'bin' / 'python3'
+    return str(venv if venv.exists() else Path(sys.executable))
+
+
+def _start_netease_worker_locked():
+    """Start a persistent pyncm worker used by search/url/playlist calls.
+
+    The old implementation spawned a fresh Python interpreter for every API
+    call.  Keeping pyncm/auth loaded in one worker preserves behavior while
+    removing process-start and session-load cost from the playback hot path.
+    """
+    global _netease_worker
+    if _netease_worker and _netease_worker.poll() is None:
+        return _netease_worker
+
+    worker_code = r'''
+import json, sys, traceback
+sys.path.insert(0, __CLOUD_SRC__)
+from cloud_music_mcp.auth import load_session
+from pyncm import apis
+load_session()
+print(json.dumps({"ok": True, "ready": True}), flush=True)
+
+def _track_obj(t):
+    artists = '/'.join([a.get('name','') for a in t.get('ar', []) if a.get('name')])
+    return {'id': str(t.get('id')), 'name': t.get('name',''), 'artist': artists, 'duration_ms': int(t.get('dt') or 0)}
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        cmd = req.get('cmd')
+        if cmd == 'search_song':
+            result = apis.cloudsearch.GetSearchResult(req.get('keyword') or '', stype=1, limit=int(req.get('limit') or 10))
+            tracks = []
+            if result.get('code') == 200 and result.get('result', {}).get('songs'):
+                tracks = [_track_obj(t) for t in result['result']['songs']]
+            resp = {'ok': True, 'tracks': tracks}
+        elif cmd == 'song_url':
+            song_id = str(req.get('song_id') or '')
+            r = apis.track.GetTrackAudioV1([int(song_id)], level='standard')
+            url = ''
+            if r.get('code') == 200 and r.get('data'):
+                url = r['data'][0].get('url') or ''
+            resp = {'ok': bool(url), 'url': url, 'raw': r if not url else {'code': r.get('code')}}
+        elif cmd == 'playlist_tracks':
+            result = apis.playlist.GetPlaylistInfo(int(req.get('playlist_id')))
+            if result.get('code') == 200 and result.get('playlist', {}).get('tracks'):
+                tracks = [_track_obj(t) for t in result['playlist']['tracks']]
+                resp = {'ok': True, 'tracks': tracks, 'name': result['playlist'].get('name', '')}
+            else:
+                resp = {'ok': False, 'raw': result}
+        else:
+            resp = {'ok': False, 'error': 'unknown cmd'}
+    except Exception as e:
+        resp = {'ok': False, 'error': str(e), 'traceback': traceback.format_exc(limit=3)}
+    print(json.dumps(resp, ensure_ascii=False), flush=True)
+'''.replace('__CLOUD_SRC__', repr(str(CLOUD_MCP_DIR / 'src')))
+
+    p = subprocess.Popen(
+        [_cloud_music_python(), '-u', '-c', worker_code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    ready = p.stdout.readline().strip()
+    try:
+        data = json.loads(ready)
+        if not data.get('ready'):
+            raise RuntimeError(ready)
+    except Exception as e:
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            err = (p.stderr.read(1000) if p.stderr else '')
+        except Exception:
+            err = ''
+        raise RuntimeError(f'netease worker failed to start: {ready} {err} {e}')
+    _netease_worker = p
+    print('[music-agent] pyncm worker started', flush=True)
+    return p
+
+
+def netease_worker_request(req, timeout=25):
+    # Serialized line protocol: one worker, one in-flight request.  On failure we
+    # drop the worker and callers fall back to the legacy subprocess path.
+    global _netease_worker
+    deadline = time.time() + timeout
+    with _netease_worker_io_lock:
+        try:
+            with _netease_worker_lock:
+                p = _start_netease_worker_locked()
+            if p.stdin is None or p.stdout is None:
+                raise RuntimeError('worker pipes unavailable')
+            p.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
+            p.stdin.flush()
+            # readline() cannot be interrupted portably, so keep the worker calls
+            # short and fall back if the child exits unexpectedly.
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError('worker closed stdout')
+            data = json.loads(line)
+            if time.time() > deadline:
+                raise TimeoutError('worker request timeout')
+            return data
+        except Exception:
+            with _netease_worker_lock:
+                if _netease_worker:
+                    try:
+                        _netease_worker.kill()
+                    except Exception:
+                        pass
+                    _netease_worker = None
+            raise
+
+
+def warm_netease_worker():
+    try:
+        netease_worker_request({'cmd': 'search_song', 'keyword': '陈奕迅 十年', 'limit': 1}, timeout=20)
+    except Exception as e:
+        print(f'[music-agent] pyncm worker warmup failed: {e}', flush=True)
+
+
+def warm_semantic_playlist_mapper():
+    """Preload semantic playlist mapper model/index at service startup.
+
+    This does not change matching logic. It only shifts the SentenceTransformer
+    load and semantic index init off the first user-visible request.
+    """
+    global _semantic_mapper_warm
+    with _semantic_mapper_warm_lock:
+        if _semantic_mapper_warm:
+            return
+        _semantic_mapper_warm = True
+    try:
+        import semantic_playlist_mapper as sem
+        t0 = time.perf_counter()
+        sem.predict('benchmark warmup', top_k=1, return_timing=True)
+        print(f'[music-agent] semantic playlist mapper warmed in {(time.perf_counter() - t0) * 1000:.1f} ms', flush=True)
+    except Exception as e:
+        print(f'[music-agent] semantic playlist mapper warmup failed: {e}', flush=True)
 
 
 
@@ -198,7 +394,7 @@ def run_play_query(query, timeout=45):
     cleared = clear_native_queue()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         audio_future = executor.submit(ensure_preferred_audio_output)
-        play_future = executor.submit(play_query_via_mpv, query, timeout=timeout)
+        play_future = executor.submit(play_query_via_ter_playlist, query, timeout=timeout)
         audio = audio_future.result()
         rc, out = play_future.result()
     if isinstance(audio, dict):
@@ -210,19 +406,22 @@ MPV_STATE_FILE = ROOT / 'runtime' / 'mpv_state.json'
 RUNTIME_DIR = ROOT / 'runtime'
 FFMPEG_BIN = RUNTIME_DIR / 'ffmpeg'
 FFPLAY_BIN = RUNTIME_DIR / 'ffplay'
+TER_PLAYER_DIR = ROOT / 'players' / 'ter-agent-player'
+TER_PLAYER_BIN = TER_PLAYER_DIR / 'target' / 'release' / 'ter-agent-player'
+TER_PLAYER_SOCKET = RUNTIME_DIR / 'ter_player.sock'
+TER_PLAYER_LOG = RUNTIME_DIR / 'ter_player.log'
 
 
 
 def save_mpv_state(state):
-    MPV_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MPV_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    _save_json_cached(MPV_STATE_FILE, state, ensure_ascii=False, indent=2)
 
 
 def load_mpv_state():
     if not MPV_STATE_FILE.exists():
         return None
     try:
-        return json.loads(MPV_STATE_FILE.read_text())
+        return _load_json_cached(MPV_STATE_FILE, default=None) or json.loads(MPV_STATE_FILE.read_text())
     except Exception:
         return None
 
@@ -231,6 +430,12 @@ def search_song_tracks(keyword, limit=10):
     keyword = (keyword or '').strip()
     if not keyword:
         return []
+    try:
+        data = netease_worker_request({'cmd': 'search_song', 'keyword': keyword, 'limit': int(limit)}, timeout=20)
+        if data.get('ok'):
+            return data.get('tracks') or []
+    except Exception as e:
+        print(f'[music-agent] search worker fallback: {e}', flush=True)
     script = f"""
 import sys, json
 sys.path.insert(0, '{CLOUD_MCP_DIR}/src')
@@ -246,7 +451,7 @@ if result.get('code') == 200 and result.get('result', {{}}).get('songs'):
         items.append({{'id': str(t.get('id')), 'name': t.get('name',''), 'artist': artists, 'duration_ms': int(t.get('dt') or 0)}})
 print(json.dumps({{'success': True, 'tracks': items}}, ensure_ascii=False))
 """
-    p = subprocess.run([PYTHON_VENV, '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+    p = subprocess.run([_cloud_music_python(), '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
     data = json.loads(p.stdout.strip())
     return data.get('tracks') or []
 
@@ -255,6 +460,14 @@ def get_song_url(song_id, force_refresh=False):
     cached = None if force_refresh else get_cached_url(song_id)
     if cached:
         return cached
+    try:
+        data = netease_worker_request({'cmd': 'song_url', 'song_id': str(song_id)}, timeout=20)
+        if data.get('ok') and data.get('url'):
+            url = data['url']
+            cache_song_url(song_id, url)
+            return url
+    except Exception as e:
+        print(f'[music-agent] url worker fallback for {song_id}: {e}', flush=True)
     script = f"""
 import sys, json
 sys.path.insert(0, '{CLOUD_MCP_DIR}/src')
@@ -268,7 +481,7 @@ if r.get('code') == 200 and r.get('data'):
     url = item.get('url') or ''
 print(json.dumps({{'success': bool(url), 'url': url, 'raw': r}}, ensure_ascii=False))
 """
-    p = subprocess.run([PYTHON_VENV, '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+    p = subprocess.run([_cloud_music_python(), '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
     data = json.loads(p.stdout.strip())
     if not data.get('success'):
         raise RuntimeError(f'get song url failed for {song_id}: {p.stdout[:500]}')
@@ -296,10 +509,179 @@ def ensure_ffplay_available():
         return str(FFPLAY_BIN)
     return None
 
+def _preferred_player_backend():
+    env = load_env()
+    return (os.environ.get('MUSIC_PLAYER_BACKEND') or env.get('MUSIC_PLAYER_BACKEND') or 'ter').strip().lower()
+
+
+def _ter_player_build_env():
+    env = os.environ.copy()
+    cargo_bin = str(Path.home() / '.cargo' / 'bin')
+    env['PATH'] = f"{cargo_bin}:/opt/homebrew/bin:/usr/local/bin:" + env.get('PATH', '')
+    return env
+
+
+def ensure_ter_player_available(build_if_missing=True):
+    if TER_PLAYER_BIN.exists():
+        TER_PLAYER_BIN.chmod(0o755)
+        return str(TER_PLAYER_BIN)
+    if not build_if_missing:
+        return None
+    cargo = shutil.which('cargo') or str(Path.home() / '.cargo' / 'bin' / 'cargo')
+    if not Path(cargo).exists() and shutil.which('cargo') is None:
+        return None
+    if not TER_PLAYER_DIR.exists():
+        return None
+    try:
+        p = subprocess.run(
+            [cargo, 'build', '--release', '--bin', 'agent_player'],
+            cwd=str(TER_PLAYER_DIR),
+            env=_ter_player_build_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+        if p.returncode != 0:
+            print(f'[music-agent] ter player build failed: {p.stdout[-2000:]}', flush=True)
+            return None
+    except Exception as e:
+        print(f'[music-agent] ter player build error: {e}', flush=True)
+        return None
+    if TER_PLAYER_BIN.exists():
+        TER_PLAYER_BIN.chmod(0o755)
+        return str(TER_PLAYER_BIN)
+    return None
+
+
 def ensure_mpv_available():
+    if _preferred_player_backend() in ('ter', 'ter-music-rust', 'rust'):
+        ter = ensure_ter_player_available(build_if_missing=True)
+        if ter:
+            return ter
     exe = shutil.which('mpv') if 'shutil' in globals() else __import__('shutil').which('mpv')
     return exe or ensure_ffplay_available()
 
+
+
+def ter_player_command(req, timeout=5):
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(str(TER_PLAYER_SOCKET))
+    s.sendall((json.dumps(req, ensure_ascii=False) + '\n').encode('utf-8'))
+    chunks = []
+    while True:
+        try:
+            data = s.recv(65536)
+        except socket.timeout:
+            break
+        if not data:
+            break
+        chunks.append(data)
+        if b'\n' in data:
+            break
+    s.close()
+    raw = b''.join(chunks).decode('utf-8', 'ignore').strip()
+    lines = [x for x in raw.splitlines() if x.strip()]
+    return json.loads(lines[-1]) if lines else {'ok': False, 'error': 'empty ter player response'}
+
+
+def ensure_ter_player_running():
+    bin_path = ensure_ter_player_available(build_if_missing=True)
+    if not bin_path:
+        return False, {'ok': False, 'error': 'ter-music-rust agent_player binary not available'}
+    try:
+        if TER_PLAYER_SOCKET.exists():
+            resp = ter_player_command({'cmd': 'status'}, timeout=1)
+            data = resp.get('data') or {}
+            if resp.get('ok') and data.get('playlist_engine') is True:
+                return True, resp
+            # Old one-shot ter daemon from the ffplay replacement stage: shut it
+            # down so the real playlist engine can start.
+            try:
+                ter_player_command({'cmd': 'shutdown'}, timeout=1)
+            except Exception:
+                pass
+            time.sleep(0.2)
+    except Exception:
+        try:
+            TER_PLAYER_SOCKET.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = open(TER_PLAYER_LOG, 'ab')
+    try:
+        p = subprocess.Popen([bin_path, '--socket', str(TER_PLAYER_SOCKET), '--resolver', MUSIC_AGENT_URL], stdout=log_file, stderr=log_file, cwd=str(TER_PLAYER_DIR))
+    finally:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+    for _ in range(30):
+        time.sleep(0.1)
+        if p.poll() is not None:
+            tail = ''
+            try:
+                tail = TER_PLAYER_LOG.read_text(errors='ignore')[-1200:]
+            except Exception:
+                pass
+            return False, {'ok': False, 'error': f'ter player exited rc={p.returncode}', 'log_tail': tail}
+        try:
+            resp = ter_player_command({'cmd': 'status'}, timeout=1)
+            if resp.get('ok'):
+                return True, {'ok': True, 'pid': p.pid, 'status': resp.get('data')}
+        except Exception:
+            pass
+    return False, {'ok': False, 'error': 'ter player socket not ready', 'pid': p.pid}
+
+
+
+def play_ter_playlist(playlist_id, playlist_name, tracks, start_index=0, shuffle=False, play_mode='loop_all'):
+    ok, info = ensure_ter_player_running()
+    if not ok:
+        return 127, f"ter-music-rust unavailable: {info}"
+    payload_tracks = []
+    for t in tracks or []:
+        payload_tracks.append({
+            'id': str(t.get('id', '')),
+            'name': t.get('name', ''),
+            'artist': t.get('artist', ''),
+            'url': t.get('url', ''),
+            'duration_ms': t.get('duration_ms'),
+        })
+    req = {
+        'cmd': 'load_playlist',
+        'playlist_id': str(playlist_id),
+        'playlist_name': playlist_name,
+        'tracks': payload_tracks,
+        'start_index': int(start_index or 0),
+        'shuffle': bool(shuffle),
+        'play_mode': play_mode,
+        'volume': 0.85,
+    }
+    try:
+        resp = ter_player_command(req, timeout=120)
+    except Exception as e:
+        return 1, f'ter-music-rust load_playlist error: {e}'
+    if not resp.get('ok'):
+        return 1, f"ter-music-rust load_playlist failed: {resp.get('error') or resp}"
+    data = resp.get('data') or {}
+    current = data.get('track') or (payload_tracks[start_index] if payload_tracks else {})
+    state = {
+        'pid': info.get('pid') or (load_mpv_state() or {}).get('pid'),
+        'playlist_id': str(playlist_id),
+        'playlist_name': playlist_name,
+        'index': int(start_index or 0),
+        'track': current,
+        'started_at': time.time(),
+        'paused': False,
+        'backend': 'ter-music-rust',
+    }
+    save_mpv_state(state)
+    return 0, f"ter-music-rust playlist loaded: {playlist_name or playlist_id} -> {current.get('name', '')} - {current.get('artist', '')}"
 
 
 def local_player_process_alive(pid):
@@ -323,63 +705,93 @@ def local_player_process_alive(pid):
     except Exception:
         return False
 
-def stop_mpv_process():
-    state = load_mpv_state() or {}
-    pid = state.get('pid')
-    if pid:
+def list_local_player_pids():
+    """Return PIDs of local lightweight players owned by this agent.
+
+    ffplay has no IPC. If a previous play request races with queue-player
+    supervision, orphan ffplay processes can keep playing. Treat the local
+    player backend as single-instance and reap every ffplay/mpv process whose
+    command points at our runtime ffplay binary or mpv IPC socket.
+    """
+    pids = []
+    try:
+        p = subprocess.run(
+            ['ps', '-axo', 'pid=,command='],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        ffplay_bin = str(FFPLAY_BIN)
+        socket_arg = f'--input-ipc-server={MPV_SOCKET}'
+        for line in (p.stdout or '').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid_s, cmd = parts
+            try:
+                pid = int(pid_s)
+            except Exception:
+                continue
+            if pid == os.getpid():
+                continue
+            if ffplay_bin in cmd or socket_arg in cmd:
+                pids.append(pid)
+    except Exception:
+        pass
+    # Include recorded PID even if ps filtering missed it. Do not include the
+    # ter-music-rust daemon: it is a long-lived IPC player, not a one-song
+    # child process like ffplay/mpv.
+    try:
+        state = load_mpv_state() or {}
+        pid = state.get('pid')
+        if pid and state.get('backend') != 'ter-music-rust':
+            pid = int(pid)
+            if pid not in pids:
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def kill_local_player_processes(grace=0.35):
+    pids = list_local_player_pids()
+    killed = []
+    for pid in pids:
         try:
             os.kill(int(pid), 15)
+            killed.append(int(pid))
+        except ProcessLookupError:
+            pass
         except Exception:
             pass
+    if killed and grace:
+        time.sleep(grace)
+        for pid in list(killed):
+            if local_player_process_alive(pid):
+                try:
+                    os.kill(int(pid), 9)
+                except Exception:
+                    pass
+    return killed
+
+
+def stop_mpv_process():
+    state = load_mpv_state() or {}
+    if state.get('backend') == 'ter-music-rust':
+        try:
+            ter_player_command({'cmd': 'stop'}, timeout=2)
+        except Exception:
+            pass
+    kill_local_player_processes()
     try:
         MPV_SOCKET.unlink()
     except FileNotFoundError:
         pass
 
-
-def play_mpv_url(url, track, queue_meta):
-    mpv = ensure_mpv_available()
-    if not mpv:
-        return 127, 'mpv/ffplay not installed'
-    stop_mpv_process()
-    MPV_SOCKET.parent.mkdir(parents=True, exist_ok=True)
-    is_ffplay = str(mpv).endswith('ffplay')
-    log_path = RUNTIME_DIR / ('ffplay.log' if is_ffplay else 'mpv.log')
-    log_file = open(log_path, 'ab')
-    if is_ffplay:
-        args = [mpv, '-nodisp', '-autoexit', '-loglevel', 'warning', url]
-    else:
-        args = [mpv, '--no-video', '--force-window=no', f'--input-ipc-server={MPV_SOCKET}', '--audio-display=no', url]
-    try:
-        p = subprocess.Popen(args, stdout=log_file, stderr=log_file)
-    finally:
-        try:
-            log_file.close()
-        except Exception:
-            pass
-
-    # Catch URL/decoder failures instead of reporting success with no audio.
-    time.sleep(0.35)
-    rc = p.poll()
-    if rc is not None:
-        tail = ''
-        try:
-            tail = log_path.read_text(errors='ignore')[-1200:]
-        except Exception:
-            pass
-        return rc or 1, f"local player exited immediately rc={rc}; log_tail={tail}"
-
-    state = {
-        'pid': p.pid,
-        'url': url,
-        'track': track,
-        'queue_meta': queue_meta,
-        'started_at': time.time(),
-        'paused': False,
-        'backend': 'ffplay' if is_ffplay else 'mpv',
-    }
-    save_mpv_state(state)
-    return 0, f"{'ffplay' if is_ffplay else 'mpv'} playing: {track.get('name')} - {track.get('artist')}"
 
 def mpv_command(command):
     state = load_mpv_state() or {}
@@ -406,7 +818,15 @@ def mpv_command(command):
 
 
 def mpv_pause_toggle(pause=True):
-    ok, data = mpv_command({'command': ['set_property', 'pause', bool(pause)]})
+    state = load_mpv_state() or {}
+    if state.get('backend') == 'ter-music-rust':
+        try:
+            data = ter_player_command({'cmd': 'pause' if pause else 'resume'}, timeout=3)
+            ok = bool(data.get('ok'))
+        except Exception as e:
+            ok, data = False, {'ok': False, 'error': str(e)}
+    else:
+        ok, data = mpv_command({'command': ['set_property', 'pause', bool(pause)]})
     if ok:
         state = load_mpv_state() or {}
         state['paused'] = bool(pause)
@@ -418,6 +838,45 @@ def mpv_status():
     state = load_mpv_state() or {}
     if not state:
         return {'playing': False}
+    if state.get('backend') == 'ter-music-rust':
+        t = state.get('track') or {}
+        try:
+            resp = ter_player_command({'cmd': 'status'}, timeout=2)
+            data = resp.get('data') or {}
+            rt = data.get('track') or t
+            return {
+                'playing': bool(data.get('playing')),
+                'alive': bool(data.get('alive')),
+                'paused': bool(data.get('paused')),
+                'finished': bool(data.get('finished')),
+                'pid': state.get('pid'),
+                'title': rt.get('name','') if isinstance(rt, dict) else t.get('name',''),
+                'artist': rt.get('artist','') if isinstance(rt, dict) else t.get('artist',''),
+                'elapsed': data.get('elapsed'),
+                'duration': data.get('duration'),
+                'mode': 'Agent Queue (ter-music-rust)',
+                'source': 'ter-music-rust',
+                'playlist_engine': bool(data.get('playlist_engine')),
+                'playlist_id': data.get('playlist_id'),
+                'playlist_name': data.get('playlist_name'),
+                'index': data.get('index'),
+                'track_count': data.get('track_count'),
+                'play_mode': data.get('play_mode'),
+                'order': data.get('order'),
+            }
+        except Exception as e:
+            # The Rust playlist daemon is lazy-started by /play. Treat a missing
+            # socket as idle rather than a service error.
+            return {
+                'playing': False,
+                'alive': False,
+                'paused': False,
+                'source': 'ter-music-rust',
+                'playlist_engine': True,
+                'title': t.get('name',''),
+                'artist': t.get('artist',''),
+                'idle_reason': str(e),
+            }
     paused = bool(state.get('paused'))
     alive = local_player_process_alive(state.get('pid'))
     t = state.get('track') or {}
@@ -433,24 +892,21 @@ def mpv_status():
     }
 
 
-def play_query_via_mpv(query, timeout=45):
+def play_query_via_ter_playlist(query, timeout=45):
     tracks = search_song_tracks(query, limit=10)
     if not tracks:
         return 1, f'no song found for query: {query}'
     track = tracks[0]
-    tid = track.get('id')
-    url = get_song_url(tid)
-    queue_meta = {'type': 'single_search', 'query': query, 'tracks': [track], 'index': 0, 'managed_by': 'mpv'}
-    save_queue(queue_meta)
-    rc, out = play_mpv_url(url, track, queue_meta)
-    if rc != 0 and tid and ('403' in str(out) or 'Forbidden' in str(out) or 'exited immediately' in str(out)):
-        invalidate_cached_url(tid)
-        try:
-            fresh_url = get_song_url(tid, force_refresh=True)
-            rc2, out2 = play_mpv_url(fresh_url, track, queue_meta)
-            return rc2, f'{out}; retried with fresh url -> {out2}'
-        except Exception as e:
-            return rc, f'{out}; fresh url retry failed: {e}'
+    # Even single-song playback is normalized into a one-item playlist so the
+    # Rust player owns the same lifecycle for song and playlist playback.
+    rc, out = play_ter_playlist(
+        playlist_id=f'single:{track.get("id") or norm_text(query)}',
+        playlist_name=track.get('name') or query,
+        tracks=[track],
+        start_index=0,
+        shuffle=False,
+        play_mode='single',
+    )
     return rc, out
 
 
@@ -465,13 +921,20 @@ PLAYLIST_KEYWORDS = [
 
 
 def load_env():
+    global _env_cache
+    try:
+        st = ENV_FILE.stat()
+    except FileNotFoundError:
+        return {}
+    if _env_cache.get('mtime') == st.st_mtime and _env_cache.get('size') == st.st_size and _env_cache.get('data') is not None:
+        return dict(_env_cache['data'])
     env = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                k, v = line.split('=', 1)
-                env[k.strip()] = v.strip()
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            env[k.strip()] = v.strip()
+    _env_cache = {'mtime': st.st_mtime, 'size': st.st_size, 'data': dict(env)}
     return env
 
 
@@ -506,14 +969,13 @@ def load_embedding_cache():
     if not EMBEDDINGS_FILE.exists():
         return {}
     try:
-        return json.loads(EMBEDDINGS_FILE.read_text())
+        return _load_json_cached(EMBEDDINGS_FILE, default=None) or json.loads(EMBEDDINGS_FILE.read_text())
     except Exception:
         return {}
 
 
 def save_embedding_cache(cache):
-    EMBEDDINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    EMBEDDINGS_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+    _save_json_cached(EMBEDDINGS_FILE, cache, ensure_ascii=False, indent=2)
 
 
 def playlist_embeddings_signature(playlists):
@@ -774,7 +1236,9 @@ def yesplay_control(action):
 def load_playlists():
     if not PLAYLISTS_FILE.exists():
         return None
-    data = json.loads(PLAYLISTS_FILE.read_text())
+    data = _load_json_cached(PLAYLISTS_FILE, default=None)
+    if data is None:
+        data = json.loads(PLAYLISTS_FILE.read_text())
     if data.get('success') and data.get('playlists'):
         return data['playlists']
     return None
@@ -788,7 +1252,9 @@ def load_tracks_cache():
     if not CACHE_TRACKS_FILE.exists():
         return {}
     try:
-        data = json.loads(CACHE_TRACKS_FILE.read_text())
+        data = _load_json_cached(CACHE_TRACKS_FILE, default=None)
+        if data is None:
+            data = json.loads(CACHE_TRACKS_FILE.read_text())
         if time.time() - data.get('updated_at', 0) < CACHE_TRACKS_TTL:
             return data.get('playlists', {})
     except Exception:
@@ -797,11 +1263,10 @@ def load_tracks_cache():
 
 
 def save_tracks_cache(cache):
-    CACHE_TRACKS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_TRACKS_FILE.write_text(json.dumps({
+    _save_json_cached(CACHE_TRACKS_FILE, {
         'updated_at': time.time(),
         'playlists': cache,
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2)
 
 
 def get_cached_tracks(playlist_id):
@@ -822,7 +1287,9 @@ def load_url_cache():
     if not CACHE_URL_FILE.exists():
         return {}
     try:
-        data = json.loads(CACHE_URL_FILE.read_text())
+        data = _load_json_cached(CACHE_URL_FILE, default=None)
+        if data is None:
+            data = json.loads(CACHE_URL_FILE.read_text())
         urls = data.get('urls', {})
         now = time.time()
         return {k: v for k, v in urls.items() if now - v.get('cached_at', 0) < URL_CACHE_TTL}
@@ -831,11 +1298,10 @@ def load_url_cache():
 
 
 def save_url_cache(cache):
-    CACHE_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_URL_FILE.write_text(json.dumps({
+    _save_json_cached(CACHE_URL_FILE, {
         'updated_at': time.time(),
         'urls': cache,
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2)
 
 
 def get_cached_url(song_id):
@@ -909,10 +1375,10 @@ def build_artist_index():
 
     # Save to disk
     ARTIST_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ARTIST_INDEX_FILE.write_text(json.dumps({
+    _save_json_cached(ARTIST_INDEX_FILE, {
         'updated_at': time.time(),
         'artists': artist_map,
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2)
 
     return artist_map
 
@@ -921,7 +1387,7 @@ def load_artist_index():
     if not ARTIST_INDEX_FILE.exists():
         return {}
     try:
-        data = json.loads(ARTIST_INDEX_FILE.read_text())
+        data = _load_json_cached(ARTIST_INDEX_FILE, default=None) or json.loads(ARTIST_INDEX_FILE.read_text())
         return data.get('artists', {})
     except Exception:
         return {}
@@ -1028,18 +1494,6 @@ def get_playlist_weight(playlist_id):
                 return float(pl.get('preference_weight', 1.0))
     return 1.0
 
-
-def prefetch_track_urls(queue, start_index, count=5):
-    """Background prefetch song URLs for upcoming tracks in a queue."""
-    tracks = queue.get('tracks') or []
-    for i in range(start_index, min(start_index + count, len(tracks))):
-        tid = str(tracks[i].get('id', ''))
-        if tid and not get_cached_url(tid):
-            try:
-                url = get_song_url(tid)
-                cache_song_url(tid, url)
-            except Exception:
-                pass
 
 
 PYTHON_VENV = str(CLOUD_MCP_DIR / '.venv' / 'bin' / 'python3')
@@ -1234,7 +1688,7 @@ def load_playlist_aliases():
     if not ALIASES_FILE.exists():
         return None
     try:
-        data = json.loads(ALIASES_FILE.read_text())
+        data = _load_json_cached(ALIASES_FILE, default=None) or json.loads(ALIASES_FILE.read_text())
         return data.get('playlists') or []
     except Exception as e:
         print(f'[music-agent] failed to load playlist aliases: {e}', flush=True)
@@ -1304,25 +1758,20 @@ def alias_table_match_playlist(query):
         'is_mine': bool(pl.get('is_mine')),
     }
 
-def save_queue(queue):
-    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    QUEUE_FILE.write_text(json.dumps(queue, ensure_ascii=False, indent=2))
-
-
-def load_queue():
-    if not QUEUE_FILE.exists():
-        return None
-    try:
-        return json.loads(QUEUE_FILE.read_text())
-    except Exception:
-        return None
-
-
 def fetch_playlist_tracks(playlist_id, force_refresh=False):
     if not force_refresh:
         cached = get_cached_tracks(playlist_id)
         if cached:
             return cached
+    try:
+        data = netease_worker_request({'cmd': 'playlist_tracks', 'playlist_id': str(playlist_id)}, timeout=30)
+        if data.get('ok'):
+            tracks = data.get('tracks') or []
+            name = data.get('name', '')
+            cache_playlist_tracks(playlist_id, name, tracks)
+            return tracks
+    except Exception as e:
+        print(f'[music-agent] playlist worker fallback for {playlist_id}: {e}', flush=True)
     script = f"""
 import sys, json
 sys.path.insert(0, '{CLOUD_MCP_DIR}/src')
@@ -1340,7 +1789,7 @@ if result.get('code') == 200 and result.get('playlist', {{}}).get('tracks'):
 else:
     print(json.dumps({{'success': False, 'raw': result}}, ensure_ascii=False))
 """
-    p = subprocess.run([PYTHON_VENV, '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    p = subprocess.run([_cloud_music_python(), '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
     data = json.loads(p.stdout.strip())
     if not data.get('success'):
         raise RuntimeError(f'fetch playlist tracks failed: {p.stdout[:500]}')
@@ -1350,44 +1799,6 @@ else:
     return tracks
 
 
-def play_track_from_queue(queue, index):
-    tracks = queue.get('tracks') or []
-    if not tracks:
-        raise RuntimeError('empty queue')
-    index = index % len(tracks)
-    t = tracks[index]
-    tid = t.get('id')
-    url = get_song_url(tid)
-    rc, out = play_mpv_url(url, t, queue)
-
-    # Signed Netease URLs can expire before our cache TTL. If ffplay/mpv exits
-    # immediately or reports 403, invalidate the URL and retry once with a fresh
-    # URL before giving up. This prevents the common “Agent says playing but no
-    # sound” failure.
-    if rc != 0 and tid and ('403' in str(out) or 'Forbidden' in str(out) or 'exited immediately' in str(out)):
-        invalidate_cached_url(tid)
-        try:
-            fresh_url = get_song_url(tid, force_refresh=True)
-            rc2, out2 = play_mpv_url(fresh_url, t, queue)
-            out = f'{out}; retried with fresh url -> {out2}'
-            rc = rc2
-        except Exception as e:
-            out = f'{out}; fresh url retry failed: {e}'
-
-    queue['index'] = index
-    queue['current'] = t
-    queue['last_started_at'] = time.time()
-    save_queue(queue)
-
-    # Record queue_index in mpv_state so the player thread can always tell
-    # which track this process is playing — needed to detect external /next /prev.
-    state = load_mpv_state() or {}
-    state['queue_index'] = index
-    save_mpv_state(state)
-
-    return rc, out, t
-
-
 def try_play_tracks_with_yesplay(tracks, source_id='agent', source_type='agent', playlist_name='', shuffle=False):
     ids = [str(t.get('id')) for t in (tracks or []) if str(t.get('id') or '').isdigit()]
     if not ids:
@@ -1395,19 +1806,6 @@ def try_play_tracks_with_yesplay(tracks, source_id='agent', source_type='agent',
     ok, data = yesplay_play_track_ids(ids, source_id=source_id, source_type=source_type, shuffle=shuffle)
     if not ok:
         return False, json.dumps(data, ensure_ascii=False)
-    queue = {
-        'type': source_type,
-        'managed_by': 'yesplaymusic',
-        'playlist_id': str(source_id),
-        'playlist_name': playlist_name,
-        'index': 0,
-        'shuffle': bool(shuffle),
-        'paused': False,
-        'created_at': time.time(),
-        'tracks': tracks,
-        'yesplay_status': data.get('status'),
-    }
-    save_queue(queue)
     return True, json.dumps(data, ensure_ascii=False)
 
 
@@ -1424,10 +1822,6 @@ def try_play_playlist(playlist_id, playlist_name='', shuffle=True, prefer_native
             audio = {**audio, 'cleared_queue': cleared}
         rc, out = run_node(['playlist', str(playlist_id)], timeout=30)
         if rc == 0:
-            try:
-                QUEUE_FILE.unlink()
-            except FileNotFoundError:
-                pass
             return f'native-netease:playlist:{playlist_id}', f'native playlist queue; audio={audio}; shuffle requested; {out}'
         print(f'[music-agent] native playlist play failed, fallback to agent queue: {out}', flush=True)
 
@@ -1443,30 +1837,14 @@ def try_play_playlist(playlist_id, playlist_name='', shuffle=True, prefer_native
 
     if shuffle and len(tracks) > 1:
         random.shuffle(tracks)
-    queue = {
-        'type': 'playlist',
-        'managed_by': 'ffplay',
-        'playlist_id': str(playlist_id),
-        'playlist_name': playlist_name,
-        'index': 0,
-        'shuffle': bool(shuffle),
-        'paused': False,
-        'created_at': time.time(),
-        'tracks': tracks,
-    }
-    rc2, out2, t = play_track_from_queue(queue, 0)
+
+    rc2, out2 = play_ter_playlist(playlist_id, playlist_name, tracks, start_index=0, shuffle=shuffle, play_mode=('shuffle' if shuffle else 'loop_all'))
     if rc2 != 0:
         raise RuntimeError(f'playback failed: {out2}')
 
-    # Prefetch URLs for upcoming tracks in background.
-    threading.Thread(target=prefetch_track_urls, args=(queue, 1, 5), daemon=True).start()
-
-    # Start the sequential player thread (idempotent).  It will wait for the
-    # currently-running ffplay process to finish, then advance to the next track.
-    ensure_queue_player_running()
-
     mode = 'shuffled' if shuffle else 'ordered'
-    return f'agent-queue:playlist:{playlist_id}', f"queued {len(tracks)} {mode} tracks; audio={audio}; now playing: {t.get('name')} - {t.get('artist')} | {out2}"
+    first = tracks[0] if tracks else {}
+    return f'agent-queue:playlist:{playlist_id}', f"queued {len(tracks)} {mode} tracks; audio={audio}; now playing: {first.get('name')} - {first.get('artist')} | {out2}"
 
 
 def search_online_playlists(keyword, limit=5):
@@ -1608,26 +1986,11 @@ def try_play_artist_collection(query):
     tracks = search_artist_tracks(keyword, limit=50)
     if not tracks:
         return None
-    queue = {
-        'type': 'artist_collection',
-        'managed_by': 'ffplay',
-        'artist_query': keyword,
-        'playlist_name': f'{keyword} 的歌',
-        'index': 0,
-        'shuffle': False,
-        'paused': False,
-        'created_at': time.time(),
-        'tracks': tracks,
-    }
-    rc, out, t = play_track_from_queue(queue, 0)
+    shuffle = False
+    rc, out = play_ter_playlist(f'artist:{keyword}', f'{keyword} 的歌', tracks, start_index=0, shuffle=shuffle, play_mode='loop_all')
     if rc != 0:
         raise RuntimeError(f'artist collection play failed: {out}')
-
-    # Prefetch upcoming URLs in background.
-    threading.Thread(target=prefetch_track_urls, args=(queue, 1, 5), daemon=True).start()
-
-    # Start the sequential player thread.
-    ensure_queue_player_running()
+    first = tracks[0] if tracks else {}
     return {
         'ok': True,
         'action': 'playlist',
@@ -1636,8 +1999,8 @@ def try_play_artist_collection(query):
         'playlist_name': f'{keyword} 的歌',
         'artist_query': keyword,
         'track_count': len(tracks),
-        'track': t,
-        'cdp_result': f'artist managed queue {len(tracks)} tracks; now playing: {t.get("name")} - {t.get("artist")} | {out}',
+        'track': first,
+        'cdp_result': f'ter-music-rust artist playlist loaded: {len(tracks)} tracks; now playing: {first.get("name")} - {first.get("artist")} | {out}',
     }
 
 def ask_llm(query, playlists):
@@ -1783,169 +2146,6 @@ def should_use_playlist(query):
     return False
 
 
-
-# ═══════════════════════════════════════════════════════════════
-# Sequential queue player (ffplay/mpv backend)
-# ═══════════════════════════════════════════════════════════════
-# ffplay has no IPC and no native playlist support — it plays one URL and exits.
-# Instead of polling, we run a single daemon thread that starts ffplay, blocks on
-# the child process via os.waitpid, and when the process exits naturally (track
-# finished) advances to the next track.  External /next, /prev, /pause work by
-# killing the current ffplay process and updating the queue state; the player
-# thread wakes from waitpid, reads the new state, and resumes from the new index.
-#
-# Architecture:
-#   _queue_player_loop()  — daemon thread, sole owner of sequential playback
-#   ensure_queue_player_running() — idempotent launcher
-#   /next, /prev handlers — kill ffplay, update index, restart via play_track_from_queue
-#   /pause handler        — kill ffplay, set paused flag
-
-_queue_player_started = False
-_queue_player_lock = threading.Lock()
-
-
-def ensure_queue_player_running():
-    global _queue_player_started
-    with _queue_player_lock:
-        if _queue_player_started:
-            return
-        _queue_player_started = True
-    threading.Thread(target=_queue_player_loop, daemon=True).start()
-    print('[music-agent] queue player thread started', flush=True)
-
-
-def _queue_player_loop():
-    """Play tracks sequentially.  Block on each ffplay process; advance on exit."""
-    while True:
-        try:
-            queue = load_queue()
-            if not queue or not queue.get('tracks') or queue.get('managed_by') not in ('ffplay', 'mpv'):
-                time.sleep(1)
-                continue
-
-            if queue.get('paused'):
-                time.sleep(0.5)
-                continue
-
-            tracks = queue.get('tracks') or []
-
-            # ── If a player process is already alive, wait for it ──
-            state = load_mpv_state() or {}
-            pid = state.get('pid')
-            if pid and local_player_process_alive(pid):
-                try:
-                    os.waitpid(int(pid), 0)
-                except ChildProcessError:
-                    pass
-                except Exception as e:
-                    print(f'[music-agent] qplayer waitpid error: {e}', flush=True)
-
-                # Reload state after process exit.  If /next or /prev changed the
-                # index while we were waiting, keep the external value.  Otherwise
-                # advance by one.  Also re-read mpv_state to catch a /pause that
-                # killed the process — the paused flag may have been set between
-                # the kill and queue save.
-                state2 = load_mpv_state() or {}
-                queue = load_queue()
-                if not queue or queue.get('paused') or state2.get('paused'):
-                    continue
-                prev_index = state.get('queue_index')
-                cur_index = queue.get('index', 0)
-                if prev_index is not None and cur_index == prev_index:
-                    queue['index'] = (cur_index + 1) % len(tracks)
-                    save_queue(queue)
-                continue
-
-            # ── No process running — play the track at current index ──
-            index = queue.get('index', 0) % len(tracks)
-            track = tracks[index]
-            tid = str(track.get('id', ''))
-
-            try:
-                url = get_song_url(tid)
-            except Exception as e:
-                print(f'[music-agent] qplayer skip track [{index}] {track.get("name")}: {e}', flush=True)
-                queue['index'] = (index + 1) % len(tracks)
-                save_queue(queue)
-                continue
-
-            rc, out = play_mpv_url(url, track, queue)
-            if rc != 0 and tid and ('403' in str(out) or 'Forbidden' in str(out) or 'exited immediately' in str(out)):
-                invalidate_cached_url(tid)
-                try:
-                    fresh_url = get_song_url(tid, force_refresh=True)
-                    rc, out = play_mpv_url(fresh_url, track, queue)
-                except Exception:
-                    pass
-
-            if rc != 0:
-                print(f'[music-agent] qplayer play failed [{index}]: {out}', flush=True)
-                queue['index'] = (index + 1) % len(tracks)
-                save_queue(queue)
-                continue
-
-            # Record which queue index this process is playing so we can detect
-            # external changes when waitpid returns.
-            state = load_mpv_state() or {}
-            state['queue_index'] = index
-            save_mpv_state(state)
-
-            queue['index'] = index
-            queue['current'] = track
-            queue['last_started_at'] = time.time()
-            save_queue(queue)
-
-            print(f'[music-agent] qplayer [{index + 1}/{len(tracks)}] {track.get("name")} - {track.get("artist")}', flush=True)
-
-            # Prefetch upcoming URLs in background.
-            threading.Thread(target=prefetch_track_urls, args=(queue, index + 1, 3), daemon=True).start()
-
-            # Loop back to top — it will wait for this process and advance.
-
-        except Exception as e:
-            print(f'[music-agent] qplayer error: {e}', flush=True)
-            time.sleep(2)
-
-
-def queue_monitor_loop():
-    """Keep NeteaseMusic aligned with the managed playlist queue.
-
-    The native app may stop after a searched single track, or auto-advance into
-    an old native queue. In either case, if we have an active Agent playlist and
-    the user has not explicitly paused it, advance to the next Agent-queue track.
-    """
-    while True:
-        try:
-            queue = load_queue()
-            if queue and queue.get('tracks') and queue.get('managed_by') == 'agent' and not queue.get('paused'):
-                age = time.time() - float(queue.get('last_started_at', 0))
-                if age >= 15:
-                    rc, out = run_node(['status'], timeout=15)
-                    if rc == 0:
-                        st = json.loads(out)
-                        current = queue.get('current') or {}
-                        expected = (current.get('name') or '').strip().lower()
-                        actual = (st.get('title') or '').strip().lower()
-                        duration_sec = max(0, int(current.get('duration_ms') or 0) / 1000)
-                        should_advance = False
-                        why = ''
-                        if st.get('playing') and expected and actual and expected not in actual and actual not in expected:
-                            should_advance = True
-                            why = f'unexpected native track actual={actual!r} expected={expected!r}'
-                        elif not st.get('playing') and duration_sec > 0 and age >= duration_sec + 8:
-                            should_advance = True
-                            why = f'native stopped after expected duration age={age:.1f}s duration={duration_sec:.1f}s'
-                        elif not st.get('playing') and duration_sec <= 0 and age >= 360:
-                            should_advance = True
-                            why = f'native stopped with unknown duration age={age:.1f}s'
-
-                        if should_advance:
-                            idx = int(queue.get('index', 0)) + 1
-                            rc2, out2, track = play_track_from_queue(queue, idx)
-                            print(f'[music-agent] queue monitor advanced: {why} -> {track}', flush=True)
-        except Exception as e:
-            print(f'[music-agent] queue monitor error: {e}', flush=True)
-        time.sleep(5)
 
 def refresh_all_caches():
     """Daily background refresh of all playlist track caches and artist index."""
@@ -2165,13 +2365,20 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
-                # Regular search-based play: clear any managed playlist queue.
-                try:
-                    QUEUE_FILE.unlink()
-                except FileNotFoundError:
-                    pass
+                # Regular search-based play: Rust player receives a one-shot track.
                 rc, out, audio = run_play_query(q)
                 self.json(200 if rc == 0 else 500, {'ok': rc == 0, 'action': 'play', 'q': q, 'output': out, 'audio_output': audio})
+                return
+            if u.path == '/song_url':
+                sid = (qs.get('id') or qs.get('song_id') or [''])[0]
+                if not sid:
+                    self.json(400, {'ok': False, 'error': 'missing id'})
+                    return
+                try:
+                    url = get_song_url(sid)
+                    self.json(200, {'ok': True, 'id': sid, 'url': url})
+                except Exception as e:
+                    self.json(500, {'ok': False, 'id': sid, 'error': str(e)})
                 return
             if u.path == '/status':
                 data = mpv_status()
@@ -2179,45 +2386,54 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if u.path in ['/pause', '/next', '/prev']:
                 cmd = u.path.strip('/')
-                if cmd in ('next', 'prev'):
-                    queue = load_queue()
-                    if queue and queue.get('tracks') and queue.get('managed_by') in ('agent', 'mpv', 'ffplay'):
-                        queue['paused'] = False
-                        step = 1 if cmd == 'next' else -1
-                        idx = int(queue.get('index', 0)) + step
-                        rc, out, track = play_track_from_queue(queue, idx)
-                        self.json(200 if rc == 0 else 500, {'ok': rc == 0, 'action': cmd, 'queue': True, 'track': track, 'output': out})
-                        return
-                audio = None
-                if cmd == 'pause':
-                    state = load_mpv_state() or {}
-                    if state.get('backend') == 'ffplay':
-                        pid = state.get('pid')
-                        ok = False
-                        if pid:
-                            try:
-                                os.kill(int(pid), 15)
-                                ok = True
-                            except Exception:
-                                ok = False
-                        state['paused'] = True
-                        save_mpv_state(state)
-                        queue = load_queue()
-                        if queue and queue.get('tracks'):
-                            queue['paused'] = True
-                            queue['paused_at'] = time.time()
-                            save_queue(queue)
-                        self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'queue': True, 'player': 'ffplay', 'output': {'killed_pid': pid}})
-                        return
-                    ok, data = mpv_pause_toggle(True)
-                    queue = load_queue()
-                    if queue and queue.get('tracks'):
-                        queue['paused'] = True
-                        queue['paused_at'] = time.time()
-                        save_queue(queue)
-                    self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'queue': True, 'player': 'mpv', 'output': data})
+                state = load_mpv_state() or {}
+                backend = state.get('backend') or 'ter-music-rust'
+                if backend == 'ter-music-rust':
+                    try:
+                        req = {'cmd': 'pause' if cmd == 'pause' else ('next' if cmd == 'next' else 'prev')}
+                        resp = ter_player_command(req, timeout=30)
+                        ok = bool(resp.get('ok'))
+                        self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'player': 'ter-music-rust', 'queue': True, 'output': resp.get('data') or resp})
+                    except Exception as e:
+                        self.json(500, {'ok': False, 'action': cmd, 'player': 'ter-music-rust', 'error': str(e)})
                     return
-                self.json(500, {'ok': False, 'action': cmd, 'error': 'unhandled control path'})
+                if cmd == 'pause':
+                    ok, data = mpv_pause_toggle(True)
+                    self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'player': backend, 'output': data})
+                    return
+                self.json(409, {'ok': False, 'action': cmd, 'player': backend, 'error': 'next/prev require ter-music-rust playlist engine'})
+                return
+            if u.path == '/resume':
+                try:
+                    resp = ter_player_command({'cmd': 'resume'}, timeout=10)
+                    ok = bool(resp.get('ok'))
+                    self.json(200 if ok else 500, {'ok': ok, 'action': 'resume', 'player': 'ter-music-rust', 'output': resp.get('data') or resp})
+                except Exception as e:
+                    self.json(500, {'ok': False, 'action': 'resume', 'player': 'ter-music-rust', 'error': str(e)})
+                return
+            if u.path == '/seek':
+                try:
+                    seconds = (qs.get('seconds') or qs.get('s') or [None])[0]
+                    ratio = (qs.get('ratio') or qs.get('r') or [None])[0]
+                    req = {'cmd': 'seek'}
+                    if seconds is not None:
+                        req['seconds'] = float(seconds)
+                    if ratio is not None:
+                        req['ratio'] = float(ratio)
+                    resp = ter_player_command(req, timeout=10)
+                    ok = bool(resp.get('ok'))
+                    self.json(200 if ok else 500, {'ok': ok, 'action': 'seek', 'player': 'ter-music-rust', 'output': resp.get('data') or resp})
+                except Exception as e:
+                    self.json(500, {'ok': False, 'action': 'seek', 'player': 'ter-music-rust', 'error': str(e)})
+                return
+            if u.path == '/mode':
+                try:
+                    mode = (qs.get('play_mode') or qs.get('mode') or ['loop_all'])[0]
+                    resp = ter_player_command({'cmd': 'set_mode', 'play_mode': mode}, timeout=10)
+                    ok = bool(resp.get('ok'))
+                    self.json(200 if ok else 500, {'ok': ok, 'action': 'mode', 'player': 'ter-music-rust', 'output': resp.get('data') or resp})
+                except Exception as e:
+                    self.json(500, {'ok': False, 'action': 'mode', 'player': 'ter-music-rust', 'error': str(e)})
                 return
             self.json(404, {'ok': False, 'error': 'not found'})
         except Exception as e:
@@ -2228,8 +2444,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    threading.Thread(target=queue_monitor_loop, daemon=True).start()
     threading.Thread(target=refresh_all_caches, daemon=True).start()
+    threading.Thread(target=warm_netease_worker, daemon=True).start()
+    threading.Thread(target=warm_semantic_playlist_mapper, daemon=True).start()
     # Build artist index on startup if tracks cache already populated
     if CACHE_TRACKS_FILE.exists() and not ARTIST_INDEX_FILE.exists():
         def _build_index_startup():
