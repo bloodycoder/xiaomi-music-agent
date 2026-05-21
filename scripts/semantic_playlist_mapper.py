@@ -432,11 +432,19 @@ def _looks_like_entity(text):
     return has_cjk or has_alpha
 
 
-def predict(query, model_name='BAAI/bge-small-zh-v1.5', top_k=5, threshold=0.50):
+def predict(query, model_name='BAAI/bge-small-zh-v1.5', top_k=5, threshold=0.50, return_timing=False):
+    t0 = time.perf_counter()
+    idx_t0 = time.perf_counter()
     idx = load_index(model_name)
+    idx_t1 = time.perf_counter()
+    nlu_t0 = time.perf_counter()
     nlu = analyze_query_mood(query)
+    nlu_t1 = time.perf_counter()
+    emb_t0 = time.perf_counter()
     qv = embed_texts(model_name, [nlu.get('expanded_query') or query])[0]
+    emb_t1 = time.perf_counter()
     query_core = _extract_query_core(query)
+    score_t0 = time.perf_counter()
     rows = []
     for it in idx['items']:
         raw_s = float(cosine(qv, it['embedding']))
@@ -466,8 +474,18 @@ def predict(query, model_name='BAAI/bge-small-zh-v1.5', top_k=5, threshold=0.50)
         hay = ((rows[0].get('text') or '') + '\n' + (rows[0].get('playlist_name') or '')).lower()
         if rows[0]['score'] < 0.58 or query_core.lower() not in hay:
             decision = 'online_fallback'
-    return {'query': query, 'decision': decision, 'threshold': threshold, 'nlu': nlu,
-            'top1': rows[0] if rows else None, 'candidates': rows[:top_k]}
+    score_t1 = time.perf_counter()
+    out = {'query': query, 'decision': decision, 'threshold': threshold, 'nlu': nlu,
+           'top1': rows[0] if rows else None, 'candidates': rows[:top_k]}
+    if return_timing:
+        out['timing'] = {
+            'total_ms': round((time.perf_counter() - t0) * 1000, 3),
+            'load_index_ms': round((idx_t1 - idx_t0) * 1000, 3),
+            'nlu_ms': round((nlu_t1 - nlu_t0) * 1000, 3),
+            'embed_ms': round((emb_t1 - emb_t0) * 1000, 3),
+            'score_ms': round((score_t1 - score_t0) * 1000, 3),
+        }
+    return out
 
 
 def main():

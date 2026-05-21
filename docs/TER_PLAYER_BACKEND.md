@@ -150,3 +150,17 @@ play_mode = single
 source = ter-music-rust
 playlist_engine = true
 ```
+
+## 2026-05-20 修复：Rust daemon 改为 ffplay 流式子进程
+
+故障现象：最初 Rust daemon 用 `rodio` 先把整首歌下载到内存再播放，`load_playlist` 会阻塞几十秒到 120 秒；小爱侧 `smartplay` 90 秒超时后表现为“智能播放了但没声音”。同时 daemon 单线程同步处理 IPC，下载期间 `/status` / `/next` 也会卡住。
+
+当前修复：保留 `ter-music-rust` 作为歌单/状态/next/prev daemon，但每首歌实际播放改为 spawn `runtime/ffplay` 流式播放 URL，不再整首下载后才开始。这样 `/play` 通常 1-2 秒返回，`/status` 继续显示 `source=ter-music-rust` 和 `playlist_engine=true`。
+
+注意：`seek` 暂时返回 unsupported；`pause/resume` 通过 `SIGSTOP/SIGCONT` 控制 ffplay 子进程。
+
+## 2026-05-20 修复：智能控制时避免 xiaomusic test-tone 抢声
+
+故障现象：用户说“智能下一首”后听到持续“bi”声。日志显示不是 Rust/ffplay 在循环，而是 xiaomusic 自己的 `test-tone.wav` 1 秒本地测试音被下一首定时器反复播放。
+
+修复：`smartplay/smartnext/smartprev/smartpause` 插件在调用 Music Agent 前只取消 xiaomusic 本地 next timer 和本地播放状态，不再让 xiaomusic 的本地 `test-tone` 队列继续跑；同时 `command_handler.py` 对智能播放/控制 exec 不再后台发送 Xiaomi cloud `player_pause/player_stop`，避免误伤 Mac→Xiaomi Sound 的蓝牙音频。`智能问/智能对话` 仍保留官方回答打断逻辑。

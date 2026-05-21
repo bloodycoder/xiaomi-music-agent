@@ -1,15 +1,14 @@
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::thread;
 use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Track {
@@ -100,9 +99,7 @@ struct Response {
 }
 
 struct PlayerState {
-    _stream: OutputStream,
-    handle: OutputStreamHandle,
-    sink: Option<Sink>,
+    child: Option<Child>,
     playlist_id: Option<String>,
     playlist_name: Option<String>,
     tracks: Vec<Track>,
@@ -123,11 +120,8 @@ struct PlayerState {
 
 impl PlayerState {
     fn new(resolver_base: String) -> Result<Self, String> {
-        let (stream, handle) = OutputStream::try_default().map_err(|e| format!("audio output init failed: {e}"))?;
         Ok(Self {
-            _stream: stream,
-            handle,
-            sink: None,
+            child: None,
             playlist_id: None,
             playlist_name: None,
             tracks: Vec::new(),
@@ -148,10 +142,10 @@ impl PlayerState {
     }
 
     fn stop_locked(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.stop();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        self.sink = None;
         self.current_track = None;
         self.current_url = None;
         self.started_at = None;
@@ -213,49 +207,29 @@ impl PlayerState {
         Ok(resolved)
     }
 
-    fn download_audio(&self, url: &str) -> Result<Vec<u8>, String> {
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
-            .user_agent("xiaomi-music-agent/ter-music-rust")
-            .build()
-            .map_err(|e| format!("http client build failed: {e}"))?;
-        let mut last_err = String::new();
-        for attempt in 1..=3 {
-            match client
-                .get(url)
-                .send()
-                .and_then(|r| r.error_for_status())
-                .and_then(|r| r.bytes())
-            {
-                Ok(b) => return Ok(b.to_vec()),
-                Err(e) => {
-                    last_err = format!("attempt {attempt}: {e}");
-                    thread::sleep(Duration::from_millis(250 * attempt as u64));
-                }
-            }
-        }
-        Err(format!("download/read audio bytes failed: {last_err}"))
-    }
-
     fn play_track_locked(&mut self, track: Track) -> Result<Value, String> {
         let resolved_url = self.resolve_track_url(&track)?;
-        let bytes = self.download_audio(&resolved_url)?;
-        let cursor = Cursor::new(bytes);
-        let decoder = Decoder::new(BufReader::new(cursor)).map_err(|e| format!("decode failed: {e}"))?;
-        let duration = decoder.total_duration();
-        let sink = Sink::try_new(&self.handle).map_err(|e| format!("audio sink failed: {e}"))?;
-        sink.set_volume(self.volume);
-        sink.append(decoder);
-        sink.play();
+        if let Some(mut old) = self.child.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        let ffplay = std::env::var("TER_FFPLAY_BIN").unwrap_or_else(|_| "/Users/picard/xiaomi-music/runtime/ffplay".to_string());
+        let volume = (self.volume * 100.0).round().clamp(0.0, 200.0).to_string();
+        let child = Command::new(&ffplay)
+            .args(["-nodisp", "-autoexit", "-loglevel", "error", "-volume", &volume, &resolved_url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn ffplay failed ({ffplay}): {e}"))?;
 
-        self.sink = Some(sink);
+        self.child = Some(child);
         self.current_track = Some(track.clone());
         self.current_url = Some(resolved_url);
         self.started_at = Some(Instant::now());
         self.paused_at = None;
         self.accumulated_paused = Duration::ZERO;
-        self.duration = duration;
+        self.duration = track.duration_ms.map(Duration::from_millis);
         self.paused = false;
         self.running = true;
         Ok(self.status_json())
@@ -292,8 +266,10 @@ impl PlayerState {
     }
 
     fn finish_locked(&mut self) {
-        if let Some(sink) = &self.sink { sink.stop(); }
-        self.sink = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         self.started_at = None;
         self.paused_at = None;
         self.running = false;
@@ -340,48 +316,26 @@ impl PlayerState {
     }
 
     fn seek_locked(&mut self, seconds: Option<f64>, ratio: Option<f64>) -> Result<Value, String> {
-        let Some(sink) = &self.sink else { return Err("not playing".to_string()); };
-        let target = if let Some(sec) = seconds {
-            Duration::from_secs_f64(sec.max(0.0))
-        } else if let (Some(r), Some(total)) = (ratio, self.duration) {
-            Duration::from_secs_f64(total.as_secs_f64() * r.clamp(0.0, 1.0))
-        } else {
-            return Err("missing seconds or ratio with known duration".to_string());
-        };
-        sink.try_seek(target).map_err(|e| format!("seek failed: {e}"))?;
-        self.accumulated_paused = target;
-        if self.paused || sink.is_paused() {
-            self.started_at = None;
-            self.paused_at = Some(Instant::now());
-            self.paused = true;
-        } else {
-            self.started_at = Some(Instant::now());
-            self.paused_at = None;
-            self.paused = false;
-        }
-        Ok(self.status_json())
+        let _ = (seconds, ratio);
+        Err("seek is not supported by the ffplay-backed Rust daemon yet".to_string())
     }
 
     fn pause_locked(&mut self) -> Value {
-        if let Some(sink) = &self.sink {
-            if !sink.is_paused() {
-                sink.pause();
-                self.paused_at = Some(Instant::now());
-                self.paused = true;
-            }
+        if let Some(child) = &self.child {
+            let _ = Command::new("kill").args(["-STOP", &child.id().to_string()]).status();
+            self.paused_at = Some(Instant::now());
+            self.paused = true;
         }
         self.status_json()
     }
 
     fn resume_locked(&mut self) -> Value {
-        if let Some(sink) = &self.sink {
-            if sink.is_paused() {
-                if let Some(t) = self.paused_at.take() {
-                    self.accumulated_paused += t.elapsed();
-                }
-                sink.play();
-                self.paused = false;
+        if let Some(child) = &self.child {
+            if let Some(t) = self.paused_at.take() {
+                self.accumulated_paused += t.elapsed();
             }
+            let _ = Command::new("kill").args(["-CONT", &child.id().to_string()]).status();
+            self.paused = false;
         }
         self.status_json()
     }
@@ -399,8 +353,10 @@ impl PlayerState {
     }
 
     fn status_json(&self) -> Value {
-        let alive = self.sink.as_ref().map(|s| !s.empty()).unwrap_or(false);
-        let paused = self.sink.as_ref().map(|s| s.is_paused()).unwrap_or(false) || self.paused;
+        let alive = self.child.as_ref().map(|child| {
+            Command::new("kill").args(["-0", &child.id().to_string()]).status().map(|s| s.success()).unwrap_or(false)
+        }).unwrap_or(false);
+        let paused = self.paused;
         let track = self.current_track.as_ref().map(|t| json!({
             "id": t.id,
             "name": t.name,
@@ -414,7 +370,7 @@ impl PlayerState {
             "alive": alive,
             "playing": alive && !paused,
             "paused": paused,
-            "finished": self.sink.is_some() && !alive,
+            "finished": self.child.is_some() && !alive,
             "elapsed": self.elapsed_secs(),
             "duration": self.duration.map(|d| d.as_secs_f64()),
             "volume": self.volume,
@@ -565,9 +521,14 @@ fn main() {
 
         {
             let mut st = state.lock().unwrap();
-            if st.sink.is_some() && !st.paused && !st.tracks.is_empty() {
-                let finished = st.sink.as_ref().map(|s| s.empty()).unwrap_or(false);
+            if st.child.is_some() && !st.paused && !st.tracks.is_empty() {
+                let finished = match st.child.as_mut().unwrap().try_wait() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => true,
+                };
                 if finished {
+                    st.child = None;
                     let _ = st.advance_after_finish_locked();
                 }
             }

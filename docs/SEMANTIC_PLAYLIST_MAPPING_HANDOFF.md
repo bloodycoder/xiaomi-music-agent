@@ -156,6 +156,43 @@ python3 scripts/semantic_playlist_mapper.py predict '冥想的时候放点音乐
 注意：这些结果还需要用户评分校准，尤其是“拉屎/厕所”这类偏好不明确的 activity。
 
 
+## 0.3 第五轮更新（2026-05-19）：benchmark 现在同时记录准确率和映射延迟
+
+从这一轮开始，`scripts/benchmark_playlist_mapping.py` 不再只关心 top1 是否准确，还会输出每条 query 的映射耗时，重点看：
+
+- `semantic_ms`：semantic mapper 在预热后的一条 query 热路径耗时
+- `semantic_embed_ms`：query embedding 耗时
+- `semantic_score_ms`：向量打分 + mood rerank 耗时
+- `semantic warmup`：首次加载 model / index 的预热成本，不计入常驻热路径
+
+当前 benchmark 结论：
+
+- 预热后 semantic 热路径平均约 **22.8 ms**，p95 约 **29.8 ms**。
+- 首次 warmup 约 **8.1 s**，主要是 sentence-transformers / 模型加载成本。
+- 这说明真正需要优化的不是每条 query 的 rerank，而是启动后的预热与冷启动策略。
+
+因此后续优化原则变成：
+
+1. 不改匹配逻辑，只优化预热 / 缓存 / 热路径。
+2. 任何改动都要同时看准确率和延迟。
+3. 如果要对比版本，至少记录 `semantic_ms` 的 avg/p50/p95/max。
+
+### 0.3.1 运行时预热补充（2026-05-19）
+
+为了避免用户第一次对话吃到 semantic mapper 的冷启动延迟，`music_agent.py` 现在在服务启动时会后台执行：
+
+```text
+semantic_playlist_mapper.predict('benchmark warmup')
+```
+
+并且 `scripts/run_music_agent_service.sh` 会优先选择已经安装了 `sentence_transformers` 的 Python 来启动 `music_agent`，这样预热真的能在同一进程内完成。
+
+注意：
+
+- 这只影响长运行的服务路径。
+- `scripts/benchmark_playlist_mapping.py` 仍然是独立进程，所以它自己的 cold-start warmup 数字不会消失；那是 benchmark 视角，不是线上对话视角。
+
+
 ## 1. 当前目标
 
 用户不想继续维护大量死规则，希望把"自然语言输入 -> 本地歌单 / 在线搜索 fallback"的映射改成更泛化的语义理解。
@@ -388,3 +425,75 @@ python3 scripts/summarize_benchmark_scores.py
 - 不要输出 `.env.local` 里的 API key。
 - 不要动 xiaomusic、小爱插件、ffplay/mpv 主播放链路，除非用户明确要求接入。
 - 用户是唯一评审，不要替用户判断结果好坏。
+
+
+## 0.3 2026-05-21：`适合周三的歌单` 误判为艺人“周三”的修复
+
+结论：这次不是小爱 ASR 错。实际进入 Music Agent 的 query 是：
+
+```text
+适合周三的歌单
+```
+
+错误来自 `scripts/music_agent.py` 的 artist_collection 规则：它看到 `周三的歌单` 中包含 `的歌`，误判成“艺人周三的歌”。
+
+修复：`is_artist_collection_query()` 增加场景/时间修饰保护；如果 query 包含 `歌单` 且同时包含 `适合/推荐/听/时候/今天/周三/星期三/...`，不走 artist_collection，而继续走本地/在线/LLM 歌单路径。
+
+验收：
+
+```bash
+python3 scripts/benchmark_playlist_mapping.py
+curl --noproxy '*' -sS 'http://127.0.0.1:8765/play?q=适合周三的歌单'
+```
+
+当前返回不再是：
+
+```text
+playlist_id = artist:周三
+playlist_name = 周三 的歌
+source = artist_collection
+```
+
+而是走歌单路径，例如：
+
+```text
+source = online_search
+playlist_name = 周三歌单
+```
+
+注意：`周三的歌` / `找周三的歌` 仍会保留为 artist_collection；`适合周三/星期三听` 是 day-of-week 场景请求。
+
+
+## 0.4 2026-05-21：明确“艺人 + 歌名”必须优先单曲
+
+问题：用户说 `播放 陈楚生 天外的天` / ASR 进入 Agent 后为 `陈楚生的天外的天`，系统错误命中本地歌单 `Persona5 -女神异闻录5`。原因是 fast playlist artist-index 规则在普通单曲搜索前执行，明确单曲 query 被高置信歌单捷径抢走。
+
+修复：`scripts/music_agent.py` 新增 explicit song guard：
+
+- `is_confident_song_match(query, track)`
+- `try_explicit_song_tracks(query)`
+- `play_explicit_song_tracks(query, tracks)`
+
+`/play` 在 fast playlist matching 前先做明确单曲检索；当 top 搜索结果同时命中标题和歌手时，直接以单曲 playlist 加载到 `ter-music-rust`，返回 `source=explicit_song`。
+
+新增回归脚本：
+
+```bash
+python3 scripts/regression_music_intents.py
+python3 scripts/regression_music_intents.py --live-play
+```
+
+必须通过：
+
+```text
+陈楚生的天外的天 -> source=explicit_song, name=天外的天, artist=陈楚生
+陈楚生 天外的天   -> source=explicit_song, name=天外的天, artist=陈楚生
+播放陈楚生天外的天 -> source=explicit_song, name=天外的天, artist=陈楚生
+```
+
+同时保留：
+
+```text
+适合周三的歌单 -> 不走 artist_collection
+找higher brothers的歌 -> 仍走 artist_collection
+```

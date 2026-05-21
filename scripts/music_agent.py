@@ -51,6 +51,23 @@ _netease_worker_io_lock = threading.Lock()
 _semantic_mapper_warm = False
 _semantic_mapper_warm_lock = threading.Lock()
 
+try:
+    _scripts_dir = str(ROOT / 'scripts')
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    from intent_filter import classify_music_intent
+except Exception as _intent_import_error:
+    classify_music_intent = None
+
+
+def local_intent_classify(query):
+    if classify_music_intent is None:
+        return {'intent': 'unknown', 'binary': None, 'confidence': 0.0, 'scores': {}, 'error': 'intent_filter unavailable'}
+    try:
+        return classify_music_intent(query)
+    except Exception as e:
+        return {'intent': 'unknown', 'binary': None, 'confidence': 0.0, 'scores': {}, 'error': str(e)}
+
 
 def _load_json_cached(path, default=None):
     path = Path(path)
@@ -597,20 +614,18 @@ def ensure_ter_player_running():
             data = resp.get('data') or {}
             if resp.get('ok') and data.get('playlist_engine') is True:
                 return True, resp
-            # Old one-shot ter daemon from the ffplay replacement stage: shut it
-            # down so the real playlist engine can start.
-            try:
-                ter_player_command({'cmd': 'shutdown'}, timeout=1)
-            except Exception:
-                pass
+            # Socket exists but daemon did not answer with a healthy playlist
+            # engine. Kill every matching daemon instead of only unlinking the
+            # socket; otherwise an unlinked but still-running stale process can
+            # keep holding audio/IPC state and make later /play requests hang.
+            killed = kill_ter_player_processes(grace=0.35)
+            if killed:
+                print(f'[music-agent] killed stale ter player processes: {killed}', flush=True)
             time.sleep(0.2)
-    except Exception:
-        try:
-            TER_PLAYER_SOCKET.unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+    except Exception as e:
+        killed = kill_ter_player_processes(grace=0.35)
+        if killed:
+            print(f'[music-agent] killed unresponsive ter player processes after status error: {killed}; error={e}', flush=True)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     log_file = open(TER_PLAYER_LOG, 'ab')
     try:
@@ -640,6 +655,10 @@ def ensure_ter_player_running():
 
 
 def play_ter_playlist(playlist_id, playlist_name, tracks, start_index=0, shuffle=False, play_mode='loop_all'):
+    # The Rust daemon now spawns ffplay children. If the daemon was killed or
+    # wedged during earlier experiments, old ffplay children can be orphaned and
+    # keep producing duplicate audio. Reap them before loading a fresh playlist.
+    kill_local_player_processes(grace=0.15)
     ok, info = ensure_ter_player_running()
     if not ok:
         return 127, f"ter-music-rust unavailable: {info}"
@@ -779,6 +798,67 @@ def kill_local_player_processes(grace=0.35):
     return killed
 
 
+def list_ter_player_pids():
+    pids = []
+    try:
+        p = subprocess.run(
+            ['ps', '-axo', 'pid=,command='],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        bin_path = str(TER_PLAYER_BIN)
+        sock_path = str(TER_PLAYER_SOCKET)
+        for line in (p.stdout or '').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid_s, cmd = parts
+            try:
+                pid = int(pid_s)
+            except Exception:
+                continue
+            if pid == os.getpid():
+                continue
+            if bin_path in cmd or ('ter-agent-player' in cmd and sock_path in cmd):
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def kill_ter_player_processes(grace=0.35):
+    pids = list_ter_player_pids()
+    killed = []
+    for pid in pids:
+        try:
+            os.kill(int(pid), 15)
+            killed.append(int(pid))
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+    if killed and grace:
+        time.sleep(grace)
+        for pid in list(killed):
+            if local_player_process_alive(pid):
+                try:
+                    os.kill(int(pid), 9)
+                except Exception:
+                    pass
+    try:
+        TER_PLAYER_SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return killed
+
+
 def stop_mpv_process():
     state = load_mpv_state() or {}
     if state.get('backend') == 'ter-music-rust':
@@ -908,6 +988,61 @@ def play_query_via_ter_playlist(query, timeout=45):
         play_mode='single',
     )
     return rc, out
+
+
+def is_confident_song_match(query, track):
+    """Whether top search result clearly satisfies an explicit song request.
+
+    Protects queries like “陈楚生的天外的天” / “周杰伦 稻香” from
+    high-confidence playlist shortcuts. This intentionally requires title and
+    artist evidence so generic scene/entity requests still go to playlist logic.
+    """
+    q = norm_text(query)
+    title = norm_text((track or {}).get('name', ''))
+    artist = norm_text((track or {}).get('artist', ''))
+    if not q or not title:
+        return False
+    if any(x in q for x in ('歌单', '推荐', '适合', '来点', '一些歌', '几首歌', '的歌单')):
+        return False
+    # ASR often inserts 的 between artist and title: 陈楚生的天外的天.
+    q_compact = q.replace('的', '')
+    title_compact = title.replace('的', '')
+    artist_names = [a for a in re.split(r'[/、,&，和]+', artist) if a]
+    artist_hit = any(a and (a in q or a in q_compact) for a in artist_names)
+    title_hit = title in q or title_compact in q_compact
+    if artist_hit and title_hit:
+        return True
+    # If the full query is basically just the title, allow title-only exact-ish
+    # song playback. Avoid very short names to prevent accidental matches.
+    if len(title) >= 4 and (q == title or q_compact == title_compact):
+        return True
+    return False
+
+
+def try_explicit_song_tracks(query):
+    if should_use_playlist(query):
+        return None
+    try:
+        tracks = search_song_tracks(query, limit=5)
+    except Exception as e:
+        print(f'[music-agent] explicit song search failed for {query!r}: {e}', flush=True)
+        return None
+    if tracks and is_confident_song_match(query, tracks[0]):
+        return tracks
+    return None
+
+
+def play_explicit_song_tracks(query, tracks):
+    track = tracks[0]
+    rc, out = play_ter_playlist(
+        playlist_id=f'single:{track.get("id") or norm_text(query)}',
+        playlist_name=track.get('name') or query,
+        tracks=[track],
+        start_index=0,
+        shuffle=False,
+        play_mode='single',
+    )
+    return rc, out, track
 
 
 PLAYLIST_KEYWORDS = [
@@ -1902,7 +2037,20 @@ def fast_online_playlist_match(query):
 
 def is_artist_collection_query(query):
     q = norm_text(query)
-    return ('的歌' in q or '一些歌' in q or '几首歌' in q or '热门歌曲' in q or '精选歌曲' in q) and not any(x in q for x in ('一首歌', '这首歌', '那首歌'))
+    if any(x in q for x in ('一首歌', '这首歌', '那首歌')):
+        return False
+    # “适合周三的歌单” / “星期三听的歌单” are scene/day-of-week
+    # playlist requests, not “artist 周三 的歌”. Only treat “的歌单” as
+    # artist intent when no scene/listening modifier is present.
+    if '歌单' in q and any(x in q for x in (
+        '适合', '推荐', '时候', '的时候', '时听', '听的歌单', '想听',
+        '今天', '今晚', '早上', '晚上', '上午', '下午', '下班', '上班',
+        '周一', '周二', '周三', '周四', '周五', '周六', '周日',
+        '星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日',
+        '礼拜一', '礼拜二', '礼拜三', '礼拜四', '礼拜五', '礼拜六', '礼拜日',
+    )):
+        return False
+    return ('的歌' in q or '一些歌' in q or '几首歌' in q or '热门歌曲' in q or '精选歌曲' in q)
 
 
 def extract_artist_collection_keyword(query):
@@ -2209,7 +2357,50 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(400, {'ok': False, 'error': 'missing q'})
                     return
 
+                intent = local_intent_classify(q)
+                print(f'[music-agent] intent_filter q:{q!r} intent:{intent}', flush=True)
+
                 playlists = load_playlists()
+
+                # Explicit song requests must win over playlist shortcuts. Queries
+                # like “陈楚生的天外的天” are not playlist intents even though
+                # local artist-index playlist matching may find unrelated dominant
+                # artist playlists.
+                explicit_tracks = try_explicit_song_tracks(q)
+                explicit_source = 'explicit_song'
+                if (
+                    not explicit_tracks
+                    and intent.get('intent') == 'explicit_track'
+                    and float(intent.get('confidence') or 0) >= 0.52
+                    and not should_use_playlist(q)
+                ):
+                    try:
+                        explicit_tracks = search_song_tracks(q, limit=5)
+                        explicit_source = 'explicit_song_classifier'
+                    except Exception as e:
+                        explicit_tracks = None
+                        print(f'[music-agent] intent explicit search failed q:{q!r}: {e}', flush=True)
+                if explicit_tracks:
+                    cleared = clear_native_queue()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        audio_future = executor.submit(ensure_preferred_audio_output)
+                        play_future = executor.submit(play_explicit_song_tracks, q, explicit_tracks)
+                        audio = audio_future.result()
+                        rc, out, track = play_future.result()
+                    if isinstance(audio, dict):
+                        audio = {**audio, 'cleared_queue': cleared}
+                    print(f'[music-agent] explicit song matched: {track.get("name")} - {track.get("artist")} q:{q} result:{out}', flush=True)
+                    self.json(200 if rc == 0 else 500, {
+                        'ok': rc == 0,
+                        'action': 'play',
+                        'source': explicit_source,
+                        'intent': intent,
+                        'q': q,
+                        'track': track,
+                        'output': out,
+                        'audio_output': audio,
+                    })
+                    return
 
                 # Fast path: first try high-confidence local playlist matching.
                 # This avoids the LLM latency for clear requests like "国语",
