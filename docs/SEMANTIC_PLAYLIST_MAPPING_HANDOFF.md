@@ -497,3 +497,138 @@ python3 scripts/regression_music_intents.py --live-play
 适合周三的歌单 -> 不走 artist_collection
 找higher brothers的歌 -> 仍走 artist_collection
 ```
+
+## 2026-05-21 补充：减少硬规则抢占，修复“下班舒缓”类组合意图
+
+用户反馈：`下班舒缓` 这类 query 不应被映射到 `kkecho` 这类实体/个人歌单。检查后发现主服务里还有旧的 `LOCAL_PLAYLIST_HINTS` 硬编码 keyword table，可能在 scene/mood query 上抢在通用 semantic mapper 之前返回固定歌单；同时 entity query 只要混合歌单里弱提到实体就可能被当成本地命中。
+
+本轮改动：
+
+1. `scripts/semantic_playlist_mapper.py`
+   - `commute_drive.triggers` 增加 `下班 / 下班后 / 上班`。
+   - 通勤 rewrite 增加 `下班 / 舒缓 / 放松`，支持 `下班舒缓` 这类组合场景。
+   - `_looks_like_entity()` 对英文艺人/乐队名放宽长度限制。
+   - entity fallback 增加 evidence density：playlist name 不含实体且正文里实体证据少于 3 次时，判为 `online_fallback`，避免 `Higher Brothers` 被 `随机推荐001` 这类混合歌单弱命中。
+2. `scripts/music_agent.py`
+   - 新增 `semantic_mapper_match_playlist()`。
+   - `fast_match_playlist()` 对 scene/mood query 优先调用 semantic mapper；旧 `LOCAL_PLAYLIST_HINTS` 只作为 semantic mapper 不可用时的兜底。
+
+本轮 benchmark：
+
+```bash
+python3 scripts/benchmark_playlist_mapping.py
+```
+
+结果文件：
+
+```text
+runtime/benchmark_results.csv
+runtime/benchmark_review.md
+```
+
+关键结果：
+
+```text
+下班舒缓             -> local 下班路上！轻快华语赶走焦虑
+下班后舒缓的音乐      -> local 下班路上！轻快华语赶走焦虑
+来个Higher Brothers的歌单 -> online_fallback（top1 虽是随机推荐001，但不作为 local）
+来点陈奕迅           -> online_fallback
+来点罗大佑经典        -> online_fallback
+```
+
+后续注意：不要再让 scene/mood query 先走固定 playlist-id/name 规则；如果必须保留硬规则，只能作为 semantic mapper 不可用时的降级 fallback，并且 benchmark 必须覆盖组合场景词。
+
+### 2026-05-21 追加修正：artist_index 空 key / 跨脚本 fuzzy
+
+复查 `music_agent.fast_match_playlist()` 时发现 `match_artist_playlist()` 还有一个更隐蔽的死板/误匹配点：artist index 里存在 normalize 后为空的非中英 artist key（例如日文假名被 `norm_text()` 清空），旧逻辑 `artist_key in artist_query` 会让空 key 命中任何 query，导致 `Higher Brothers`、甚至 `下班舒缓` 的 artist matcher 可错配到 Persona5 之类歌单。
+
+已修：
+
+- partial artist match 跳过空 `artist_key`。
+- fuzzy artist match 也跳过空 key。
+- fuzzy 改为比较 stripped `artist_query`，不再拿完整命令比较。
+- ASCII 英文 query 不再跨脚本 fuzzy 到非 ASCII artist key。
+
+验证：
+
+```text
+music_agent.fast_match_playlist('来个Higher Brothers的歌单') -> None
+music_agent.fast_match_playlist('下班舒缓') -> semantic mapper: commute_drive,relax_calm
+python3 scripts/regression_music_intents.py -> OK
+```
+
+## 2026-05-28 补充：手动同步网易云歌单 + 禁用规则
+
+用户认为修改歌单是低频操作，当前不做每日自动同步，改为手动脚本：
+
+```bash
+cd /Users/picard/xiaomi-music
+scripts/sync_netease_playlists.sh
+```
+
+行为：
+
+1. 从当前 pyncm 登录账号拉取网易云歌单列表。
+2. 写入：
+   ```text
+   runtime/playlists.json
+   ```
+3. 默认刷新所有“启用歌单”的曲目缓存：
+   ```text
+   runtime/playlist_tracks_cache.json
+   ```
+4. 清理已删除/已禁用歌单的曲目缓存。
+5. 重建 alias：
+   ```text
+   runtime/playlist_aliases.json
+   ```
+6. 语义 embedding/index 不强制重建；后续会因 `playlists.json` / `playlist_tracks_cache.json` 文件签名变化自动失效重建。
+
+可选参数：
+
+```bash
+scripts/sync_netease_playlists.sh --list-only     # 只同步歌单列表/alias，不刷新曲目
+scripts/sync_netease_playlists.sh --missing-only  # 只为新增或缺失歌单补曲目缓存
+```
+
+禁用规则文件：
+
+```text
+runtime/music_disabled.json
+```
+
+示例：
+
+```json
+{
+  "disabled_playlists": [
+    {"id": "123456789", "reason": "不想让这个歌单参与推荐"},
+    {"name": "某个歌单名"}
+  ],
+  "disabled_tracks": [
+    {"id": "987654321", "reason": "不播这首歌"},
+    {"name": "某首歌", "artist": "某歌手"}
+  ],
+  "disabled_artists": [
+    {"name": "某歌手"}
+  ]
+}
+```
+
+接入点：
+
+```text
+scripts/music_disable_rules.py
+scripts/music_agent.py              # load_playlists/get_cached_tracks/fetch_playlist_tracks 过滤
+scripts/semantic_playlist_mapper.py # load_playlists/load_tracks 过滤
+scripts/build_playlist_aliases.py   # alias 生成跳过禁用歌单
+```
+
+注意：
+
+- 禁用规则是本地规则，不调用大模型，不耗 token。
+- 修改 `runtime/music_disabled.json` 后，Music Agent 通过 mtime/size 缓存会在下一次读文件时生效；如果刚好已有 active queue，需要重新播放/下一次同步才会彻底清掉旧队列影响。
+- 禁用规则属于映射/队列输入变化；如果改动较大，仍建议执行：
+  ```bash
+  python3 scripts/benchmark_playlist_mapping.py
+  ```

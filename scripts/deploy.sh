@@ -37,9 +37,20 @@ PLIST
 write_plist "${LABEL_PREFIX}.xiaomusic" "$XIAOMI_MUSIC_ROOT/scripts/run_xiaomusic_service.sh" "$LOG_DIR/xiaomusic.out.log" "$LOG_DIR/xiaomusic.err.log"
 write_plist "${LABEL_PREFIX}.music-agent" "$XIAOMI_MUSIC_ROOT/scripts/run_music_agent_service.sh" "$LOG_DIR/music-agent.out.log" "$LOG_DIR/music-agent.err.log"
 write_plist "${LABEL_PREFIX}.netease-cdp" "$XIAOMI_MUSIC_ROOT/scripts/run_netease_cdp_service.sh" "$LOG_DIR/netease-cdp.out.log" "$LOG_DIR/netease-cdp.err.log"
+write_plist "${LABEL_PREFIX}.health-watchdog" "$XIAOMI_MUSIC_ROOT/scripts/health_watchdog.sh" "$LOG_DIR/health-watchdog.out.log" "$LOG_DIR/health-watchdog.err.log"
+# Watchdog is a periodic checker, not a daemon. Disable KeepAlive and run every 60s.
+/usr/bin/python3 - <<PY
+import plistlib
+from pathlib import Path
+p = Path(r"$PLIST_DIR/${LABEL_PREFIX}.health-watchdog.plist")
+data = plistlib.loads(p.read_bytes())
+data.pop("KeepAlive", None)
+data["StartInterval"] = 300
+plistlib.dump(data, p.open("wb"))
+PY
 
 uid="$(id -u)"
-for svc in xiaomusic music-agent netease-cdp; do
+for svc in xiaomusic music-agent netease-cdp health-watchdog; do
   label="${LABEL_PREFIX}.${svc}"
   launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
   launchctl bootstrap "gui/${uid}" "$PLIST_DIR/${label}.plist" 2>/dev/null || true

@@ -2,6 +2,13 @@
 from __future__ import annotations
 import argparse, json, math, os, re, time
 from pathlib import Path
+try:
+    from music_disable_rules import filter_playlists, filter_tracks
+except Exception:
+    def filter_playlists(playlists, rules=None):
+        return list(playlists or [])
+    def filter_tracks(tracks, rules=None):
+        return list(tracks or [])
 
 ROOT = Path(os.environ.get('XIAOMI_MUSIC_ROOT', Path.home() / 'xiaomi-music')).expanduser()
 PLAYLISTS_FILE = ROOT / 'runtime' / 'playlists.json'
@@ -21,7 +28,7 @@ def compact(s: str) -> str:
 def load_playlists():
     d = json.loads(PLAYLISTS_FILE.read_text(encoding='utf-8'))
     pls = d.get('playlists', d if isinstance(d, list) else [])
-    return pls
+    return filter_playlists(pls)
 
 
 def load_aliases():
@@ -87,8 +94,14 @@ def load_tracks():
         return {}
     # Handle nested structure: {"playlists": {"<pid>": {"tracks": [...]}}}
     if 'playlists' in d:
-        return d['playlists']
-    return d
+        d = d['playlists']
+    out = {}
+    for pid, entry in (d or {}).items():
+        if isinstance(entry, dict) and isinstance(entry.get('tracks'), list):
+            out[pid] = {**entry, 'tracks': filter_tracks(entry.get('tracks'))}
+        else:
+            out[pid] = entry
+    return out
 
 
 def profile_text(pl, aliases, tracks):
@@ -182,8 +195,8 @@ _MOOD_PROFILES = {
         'negative_name_terms': _NOISE_PLAYLIST_WORDS + ('睡眠', '助眠', '冥想'),
     },
     'commute_drive': {
-        'triggers': ('通勤', '上班路上', '下班路上', '开车', '车上', '路上', '堵车', '地铁'),
-        'query_terms': '通勤 开车 路上 轻快 有节奏 提神 旋律 华语 说唱 流行 赶走焦虑 歌单',
+        'triggers': ('通勤', '上班路上', '下班路上', '下班后', '下班', '上班', '开车', '车上', '路上', '堵车', '地铁'),
+        'query_terms': '通勤 下班 开车 路上 轻快 有节奏 舒缓 放松 提神 旋律 华语 流行 赶走焦虑 歌单',
         'positive_name_terms': ('下班路上', '车机', '旋律rap', '有节奏', '轻快', '说唱时刻'),
         'negative_name_terms': _NOISE_PLAYLIST_WORDS + ('睡眠', '助眠', '冥想', '安静60分钟'),
     },
@@ -419,7 +432,11 @@ def _looks_like_entity(text):
     rather than a mood descriptor?"""
     if not text or len(text) < 2:
         return False
-    if len(text) > 10:  # Long phrases are likely descriptions, not entities
+    has_alpha = any(c.isalpha() for c in text)
+    # Chinese mood sentences are often long descriptions; English artist/band
+    # names such as "Higher Brothers" can be longer and should still get
+    # entity-evidence verification.
+    if (has_alpha and len(text) > 32) or (not has_alpha and len(text) > 10):
         return False
     if text in _MOOD_WORDS:
         return False
@@ -428,7 +445,6 @@ def _looks_like_entity(text):
         if w in text:
             return False
     has_cjk = any('一' <= c <= '鿿' for c in text)
-    has_alpha = any(c.isalpha() for c in text)
     return has_cjk or has_alpha
 
 
@@ -469,10 +485,15 @@ def predict(query, model_name='BAAI/bge-small-zh-v1.5', top_k=5, threshold=0.50,
         decision = 'online_fallback'
     elif nlu.get('intent') != 'scene_mood' and _looks_like_entity(query_core):
         # Entity queries (artists, bands): avoid treating a weak mention inside a
-        # broad playlist as a dedicated local match.  Above 0.58 we still require
-        # the entity to be present; below that, prefer online fallback.
+        # broad/mixed playlist as a dedicated local match.  A single track mention
+        # like "Higher Brothers" inside "随机推荐001" is not enough evidence
+        # that the playlist is actually about that entity.
         hay = ((rows[0].get('text') or '') + '\n' + (rows[0].get('playlist_name') or '')).lower()
-        if rows[0]['score'] < 0.58 or query_core.lower() not in hay:
+        name = (rows[0].get('playlist_name') or '').lower()
+        core = query_core.lower()
+        evidence_count = hay.count(core) if core else 0
+        name_has_entity = bool(core and core in name)
+        if rows[0]['score'] < 0.58 or core not in hay or (not name_has_entity and evidence_count < 3):
             decision = 'online_fallback'
     score_t1 = time.perf_counter()
     out = {'query': query, 'decision': decision, 'threshold': threshold, 'nlu': nlu,

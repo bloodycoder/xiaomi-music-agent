@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import urlparse, parse_qs
 import json
 import subprocess
@@ -14,6 +15,7 @@ import random
 import shutil
 import hashlib
 import concurrent.futures
+import html
 from pathlib import Path
 
 ROOT = Path(os.environ.get('XIAOMI_MUSIC_ROOT', Path.home() / 'xiaomi-music')).expanduser()
@@ -38,6 +40,94 @@ _last_audio_switch_time = 0
 _last_audio_switch_device = ''
 _embedding_disabled_until = 0
 
+
+SCENES = [
+    '卧室', '开车', '客厅', '洗澡', '厨房', '通勤', '办公室', '书房', '健身房',
+    '咖啡馆', '阳台', '下雨天', '夜晚', '清晨', '午后', '睡前', '散步', '旅行',
+    '做饭', '打扫卫生', '工作学习', '写代码', '读书', '游戏', '独处', '朋友聚会',
+]
+FEELINGS = [
+    '慵懒', '放松', '治愈', '开心', '安静', '温柔', '浪漫', '怀旧', '热血',
+    '专注', '困了', '清醒', '孤独', '自由', '松弛', '微醺', 'emo', '甜',
+    '轻快', '高级感', '梦幻', '舒服', '平静', '有力量', '想唱歌', '想发呆',
+]
+
+def sample_random(items, count=5):
+    items = list(items or [])
+    if len(items) <= count:
+        random.shuffle(items)
+        return items
+    return random.sample(items, count)
+
+def playlist_title(playlist):
+    return str(playlist.get('name') or playlist.get('title') or playlist.get('id') or '未知歌单')
+
+def build_suggestions():
+    playlists = load_playlists() or []
+    return {'playlists': sample_random(playlists, 5), 'scenes': sample_random(SCENES, 5), 'feelings': sample_random(FEELINGS, 5)}
+
+def render_music_ui_html():
+    suggestions = build_suggestions()
+    playlist_cards = []
+    for p in suggestions['playlists']:
+        pid = html.escape(str(p.get('id') or ''))
+        name = html.escape(playlist_title(p))
+        creator = html.escape(str(p.get('creator') or ''))
+        count = html.escape(str(p.get('count') or ''))
+        meta = ' · '.join(x for x in [f'{count}首' if count else '', creator] if x)
+        playlist_cards.append(f'<button class="pick playlist" data-id="{pid}" data-name="{name}"><b>{name}</b><small>{html.escape(meta)}</small></button>')
+    if not playlist_cards:
+        playlist_cards.append('<div class="empty">还没有缓存到歌单。</div>')
+    scene_chips = ''.join(f'<button class="chip scene" data-value="{html.escape(x)}">{html.escape(x)}</button>' for x in suggestions['scenes'])
+    feeling_chips = ''.join(f'<button class="chip feeling" data-value="{html.escape(x)}">{html.escape(x)}</button>' for x in suggestions['feelings'])
+    tpl = MUSIC_UI_HTML
+    css = '''
+    .section-title { margin:18px 0 10px; color:#dbe7ff; font-size:16px; font-weight:750; }
+    .pickgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:6px; }
+    .pick { text-align:left; min-height:72px; background:linear-gradient(135deg,#233154,#18223c); border:1px solid rgba(255,255,255,.08); }
+    .pick b { display:block; margin-bottom:6px; font-size:15px; }
+    .pick small { display:block; color:var(--muted); font-weight:500; }
+    .chips { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
+    .chip { min-height:38px; padding:9px 12px; font-size:15px; border-radius:999px; background:#202a45; color:#dbe7ff; }
+    .pick.selected,.chip.selected { outline:2px solid #73d13d; background:#244626; }
+    .empty { color:var(--muted); padding:8px; }
+  </style>'''
+    tpl = tpl.replace('</style>', css)
+    block = f'''
+    <div class="section-title">🎲 每次刷新随机 5 个歌单</div>
+    <div class="pickgrid" id="randomPlaylists">{''.join(playlist_cards)}</div>
+    <div class="section-title">📍 随机 5 个场景</div>
+    <div class="chips" id="randomScenes">{scene_chips}</div>
+    <div class="section-title">🫧 随机 5 种感觉</div>
+    <div class="chips" id="randomFeelings">{feeling_chips}</div>
+    <div class="row"><button id="guessPick" class="grow">✨ 根据选择播放</button><button onclick="location.reload()">🔄 换一批</button></div>'''
+    tpl = tpl.replace('    <div class="row quick">', block + '\n    <div class="row quick">')
+    script = r'''
+let selectedPlaylist = null, selectedScene = '', selectedFeeling = '';
+document.querySelectorAll('.playlist').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.playlist').forEach(x => x.classList.remove('selected'));
+  btn.classList.add('selected'); selectedPlaylist = {id: btn.dataset.id, name: btn.dataset.name}; q.value = selectedPlaylist.name;
+  call('/playlist?id=' + encodeURIComponent(selectedPlaylist.id));
+}));
+document.querySelectorAll('.scene').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.scene').forEach(x => x.classList.remove('selected'));
+  btn.classList.add('selected'); selectedScene = btn.dataset.value; q.value = [selectedScene, selectedFeeling, '歌单'].filter(Boolean).join(' ');
+}));
+document.querySelectorAll('.feeling').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.feeling').forEach(x => x.classList.remove('selected'));
+  btn.classList.add('selected'); selectedFeeling = btn.dataset.value; q.value = [selectedScene, selectedFeeling, '歌单'].filter(Boolean).join(' ');
+}));
+const guessPick = document.getElementById('guessPick');
+if (guessPick) guessPick.onclick = () => {
+  if (selectedPlaylist) return call('/playlist?id=' + encodeURIComponent(selectedPlaylist.id));
+  const text = [selectedScene, selectedFeeling, '歌单'].filter(Boolean).join(' ');
+  if (!text.trim()) { hint.innerHTML = '<span class="bad">先选一个歌单、场景或感觉</span>'; return; }
+  q.value = text; playAndEnsure(text);
+};
+'''
+    tpl = tpl.replace('</script>', script + '\n</script>')
+    return tpl
+
 # Hot-path caches.  Voice commands are latency sensitive; repeatedly parsing
 # the same runtime JSON files and respawning Python just to hit pyncm adds
 # avoidable overhead.  These caches are mtime/size guarded, so external edits to
@@ -56,8 +146,16 @@ try:
     if _scripts_dir not in sys.path:
         sys.path.insert(0, _scripts_dir)
     from intent_filter import classify_music_intent
+    from music_disable_rules import filter_playlists, filter_tracks
 except Exception as _intent_import_error:
     classify_music_intent = None
+    try:
+        from music_disable_rules import filter_playlists, filter_tracks
+    except Exception:
+        def filter_playlists(playlists, rules=None):
+            return list(playlists or [])
+        def filter_tracks(tracks, rules=None):
+            return list(tracks or [])
 
 
 def local_intent_classify(query):
@@ -330,6 +428,32 @@ def ensure_bluetooth_connector_built():
         return False, str(e)
 
 
+
+def current_default_audio_output():
+    """Return the current macOS default output device name using our helper."""
+    ok, info = ensure_audio_switcher_built()
+    if not ok:
+        return None, info
+    try:
+        p = subprocess.run(
+            [str(AUDIO_SWITCHER_BIN), '--list'],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+        out = (p.stdout or '').strip()
+        if p.returncode != 0:
+            return None, out or f'list failed: {p.returncode}'
+        for line in out.splitlines():
+            if '\tdefault' in line or line.rstrip().endswith('\tdefault'):
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    return parts[1].strip(), out
+        return None, out
+    except Exception as e:
+        return None, str(e)
+
 def ensure_bluetooth_connected():
     """Best-effort connect of the paired Bluetooth speaker before playback."""
     target = preferred_bluetooth_device()
@@ -339,42 +463,82 @@ def ensure_bluetooth_connected():
     if not ok:
         print(f'[music-agent] bluetooth connector unavailable: {info}', flush=True)
         return {'ok': False, 'device': target, 'error': info}
-    try:
-        p = subprocess.run(
-            [str(BLUETOOTH_CONNECT_BIN), target],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=18,
-        )
-        out = (p.stdout or '').strip()
-        if p.returncode != 0:
+    last_out = ''
+    # IOBluetooth can transiently return an empty paired-device list just after
+    # wake/reconnect. Retry before giving up; otherwise playback may fall back
+    # to the Mac mini speaker.
+    for attempt in range(1, 4):
+        try:
+            p = subprocess.run(
+                [str(BLUETOOTH_CONNECT_BIN), target],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=18,
+            )
+            out = (p.stdout or '').strip()
+            last_out = out
+            if p.returncode == 0:
+                return {'ok': True, 'device': target, 'output': out, 'attempts': attempt}
+            if attempt < 3 and ('not found' in out.lower() or not out):
+                time.sleep(1.0)
+                continue
             print(f'[music-agent] bluetooth connect failed for {target!r}: {out}', flush=True)
-        return {'ok': p.returncode == 0, 'device': target, 'output': out}
-    except Exception as e:
-        print(f'[music-agent] bluetooth connect error for {target!r}: {e}', flush=True)
-        return {'ok': False, 'device': target, 'error': str(e)}
+            return {'ok': False, 'device': target, 'output': out, 'attempts': attempt}
+        except Exception as e:
+            last_out = str(e)
+            if attempt < 3:
+                time.sleep(1.0)
+                continue
+            print(f'[music-agent] bluetooth connect error for {target!r}: {e}', flush=True)
+            return {'ok': False, 'device': target, 'error': str(e), 'attempts': attempt}
+    return {'ok': False, 'device': target, 'output': last_out, 'attempts': 3}
 
 def ensure_preferred_audio_output():
-    """Best-effort connect Bluetooth and switch macOS output before playback."""
+    """Best-effort connect Bluetooth and switch macOS output before playback.
+
+    Do not trust the cooldown cache blindly: macOS may silently switch the
+    default output back to Mac mini speakers after Bluetooth profile changes or
+    sleep/wake. Always verify the current default output before allowing local
+    playback to start.
+    """
     global _last_audio_switch_time, _last_audio_switch_device
     target = preferred_audio_output_device()
     now = time.time()
-    if _last_audio_switch_device == target and (now - _last_audio_switch_time) < AUDIO_SWITCH_COOLDOWN:
-        return {'ok': True, 'skipped': True, 'reason': f'already on {target} (switched {now - _last_audio_switch_time:.0f}s ago)', 'bluetooth': {'ok': True, 'skipped': True}}
-    bluetooth = ensure_bluetooth_connected()
     if not target:
+        bluetooth = ensure_bluetooth_connected()
         return {'ok': True, 'skipped': True, 'reason': 'empty MUSIC_OUTPUT_DEVICE', 'bluetooth': bluetooth}
+
+    current, current_info = current_default_audio_output()
+    if current == target:
+        _last_audio_switch_time = now
+        _last_audio_switch_device = target
+        return {'ok': True, 'device': target, 'current': current, 'skipped': True, 'reason': f'already current default output: {target}', 'bluetooth': {'ok': True, 'skipped': True}}
+
+    # Only use the historical cooldown as a hint in logs, never as a reason to
+    # skip when the verified default output is not the target.
+    cooldown_hint = None
+    if _last_audio_switch_device == target and (now - _last_audio_switch_time) < AUDIO_SWITCH_COOLDOWN:
+        cooldown_hint = f'cache said switched {now - _last_audio_switch_time:.0f}s ago, but current default is {current or "unknown"}'
+
+    bluetooth = ensure_bluetooth_connected()
     ok, info = ensure_audio_switcher_built()
     if not ok:
         print(f'[music-agent] audio output switcher unavailable: {info}', flush=True)
-        return {'ok': False, 'device': target, 'error': info, 'bluetooth': bluetooth}
+        return {'ok': False, 'device': target, 'current': current, 'error': info, 'bluetooth': bluetooth, 'cooldown_hint': cooldown_hint}
     last_out = ''
     # After a Bluetooth connection succeeds, the A2DP/CoreAudio output device can
     # appear a few seconds later. Retry so playback does not race the audio
     # profile becoming available.
-    for attempt in range(1, 7):
+    for attempt in range(1, 9):
         try:
+            # Re-check default each loop; another process or macOS may have
+            # fixed it while Bluetooth was connecting.
+            current, _ = current_default_audio_output()
+            if current == target:
+                _last_audio_switch_time = time.time()
+                _last_audio_switch_device = target
+                return {'ok': True, 'device': target, 'current': current, 'output': f'already default output: {target}', 'bluetooth': bluetooth, 'attempts': attempt, 'cooldown_hint': cooldown_hint}
             p = subprocess.run(
                 [str(AUDIO_SWITCHER_BIN), target],
                 text=True,
@@ -385,37 +549,72 @@ def ensure_preferred_audio_output():
             out = (p.stdout or '').strip()
             last_out = out
             if p.returncode == 0:
-                _last_audio_switch_time = time.time()
-                _last_audio_switch_device = target
-                return {'ok': True, 'device': target, 'output': out, 'bluetooth': bluetooth, 'attempts': attempt}
-            if attempt < 6 and ('not found' in out.lower() or 'Available:' in out):
+                # Verify the switch really took; do not rely only on helper exit
+                # status because CoreAudio can lag after Bluetooth reconnect.
+                verified, verify_info = current_default_audio_output()
+                if verified == target:
+                    _last_audio_switch_time = time.time()
+                    _last_audio_switch_device = target
+                    return {'ok': True, 'device': target, 'current': verified, 'output': out, 'bluetooth': bluetooth, 'attempts': attempt, 'cooldown_hint': cooldown_hint}
+                last_out = f'{out}; verify default={verified or "unknown"}; {verify_info}'
+            if attempt < 8 and ('not found' in last_out.lower() or 'Available:' in last_out or 'verify default=' in last_out):
                 time.sleep(1.0)
                 continue
-            print(f'[music-agent] audio output switch failed for {target!r}: {out}', flush=True)
-            return {'ok': False, 'device': target, 'output': out, 'bluetooth': bluetooth, 'attempts': attempt}
+            print(f'[music-agent] audio output switch failed for {target!r}: {last_out}', flush=True)
+            return {'ok': False, 'device': target, 'current': current, 'output': last_out, 'bluetooth': bluetooth, 'attempts': attempt, 'cooldown_hint': cooldown_hint}
         except Exception as e:
             last_out = str(e)
-            if attempt < 6:
+            if attempt < 8:
                 time.sleep(1.0)
                 continue
             print(f'[music-agent] audio output switch error for {target!r}: {e}', flush=True)
-            return {'ok': False, 'device': target, 'error': str(e), 'bluetooth': bluetooth, 'attempts': attempt}
-    return {'ok': False, 'device': target, 'output': last_out, 'bluetooth': bluetooth, 'attempts': 6}
+            return {'ok': False, 'device': target, 'current': current, 'error': str(e), 'bluetooth': bluetooth, 'attempts': attempt, 'cooldown_hint': cooldown_hint}
+    return {'ok': False, 'device': target, 'current': current, 'output': last_out, 'bluetooth': bluetooth, 'attempts': 8, 'cooldown_hint': cooldown_hint}
+
+def pause_native_netease_best_effort():
+    """Stop the legacy Netease UI from being a second audible source.
+
+    The Rust/ffplay daemon is now the only intended player. The official
+    Netease app may still be running for historical CDP/login reasons, or may
+    have been started by older commands. Pause it before every Agent-owned play
+    request so a stale native queue cannot overlap the Rust player.
+    """
+    try:
+        rc, out = run_node(['status'], timeout=5)
+        if rc != 0:
+            return {'ok': False, 'action': 'netease_status', 'error': out[-500:]}
+        try:
+            data = json.loads(out)
+        except Exception:
+            data = {}
+        if not data.get('playing'):
+            return {'ok': True, 'action': 'netease_pause', 'skipped': True, 'reason': 'already paused', 'status': data}
+        rc2, out2 = run_node(['pause'], timeout=5)
+        return {'ok': rc2 == 0, 'action': 'netease_pause', 'output': out2[-500:], 'previous_status': data}
+    except Exception as e:
+        return {'ok': False, 'action': 'netease_pause', 'error': str(e)}
 
 
 def clear_native_queue():
-    return {'ok': True, 'skipped': True, 'reason': 'mpv backend does not use native netease queue'}
+    killed = kill_local_player_processes(grace=0.15)
+    native = pause_native_netease_best_effort()
+    return {
+        'ok': True,
+        'single_source_guard': True,
+        'target_source': 'ter-music-rust',
+        'killed_orphan_local_players': killed,
+        'native_netease': native,
+    }
 
 
 def run_play_query(query, timeout=45):
     cleared = clear_native_queue()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        audio_future = executor.submit(ensure_preferred_audio_output)
-        play_future = executor.submit(play_query_via_ter_playlist, query, timeout=timeout)
-        audio = audio_future.result()
-        rc, out = play_future.result()
+    audio = ensure_preferred_audio_output()
     if isinstance(audio, dict):
         audio = {**audio, 'cleared_queue': cleared}
+    if isinstance(audio, dict) and not audio.get('ok', False):
+        return 1, f"preferred audio output unavailable; refusing to play through Mac speakers: {audio}", audio
+    rc, out = play_query_via_ter_playlist(query, timeout=timeout)
     return rc, out, audio
 
 MPV_SOCKET = ROOT / 'runtime' / 'mpv.sock'
@@ -450,7 +649,7 @@ def search_song_tracks(keyword, limit=10):
     try:
         data = netease_worker_request({'cmd': 'search_song', 'keyword': keyword, 'limit': int(limit)}, timeout=20)
         if data.get('ok'):
-            return data.get('tracks') or []
+            return filter_tracks(data.get('tracks') or [])
     except Exception as e:
         print(f'[music-agent] search worker fallback: {e}', flush=True)
     script = f"""
@@ -470,7 +669,7 @@ print(json.dumps({{'success': True, 'tracks': items}}, ensure_ascii=False))
 """
     p = subprocess.run([_cloud_music_python(), '-c', script], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
     data = json.loads(p.stdout.strip())
-    return data.get('tracks') or []
+    return filter_tracks(data.get('tracks') or [])
 
 
 def get_song_url(song_id, force_refresh=False):
@@ -681,26 +880,62 @@ def play_ter_playlist(playlist_id, playlist_name, tracks, start_index=0, shuffle
         'play_mode': play_mode,
         'volume': 0.85,
     }
-    try:
-        resp = ter_player_command(req, timeout=120)
-    except Exception as e:
-        return 1, f'ter-music-rust load_playlist error: {e}'
-    if not resp.get('ok'):
-        return 1, f"ter-music-rust load_playlist failed: {resp.get('error') or resp}"
-    data = resp.get('data') or {}
-    current = data.get('track') or (payload_tracks[start_index] if payload_tracks else {})
-    state = {
-        'pid': info.get('pid') or (load_mpv_state() or {}).get('pid'),
-        'playlist_id': str(playlist_id),
-        'playlist_name': playlist_name,
-        'index': int(start_index or 0),
-        'track': current,
-        'started_at': time.time(),
-        'paused': False,
-        'backend': 'ter-music-rust',
-    }
-    save_mpv_state(state)
-    return 0, f"ter-music-rust playlist loaded: {playlist_name or playlist_id} -> {current.get('name', '')} - {current.get('artist', '')}"
+    attempts = []
+    if payload_tracks:
+        n = len(payload_tracks)
+        # Some NetEase URLs are accepted by ffplay but exit immediately (dead/VIP/region
+        # source). Treat that as a failed start and skip ahead a few tracks for
+        # playlists instead of returning a misleading 200 OK with no sound.
+        max_attempts = min(n, 6)
+        attempts = [((int(start_index or 0) + i) % n) for i in range(max_attempts)]
+    else:
+        attempts = [int(start_index or 0)]
+
+    last_status = None
+    last_error = None
+    for attempt_index in attempts:
+        req['start_index'] = int(attempt_index)
+        try:
+            resp = ter_player_command(req, timeout=120)
+        except Exception as e:
+            last_error = f'ter-music-rust load_playlist error: {e}'
+            continue
+        if not resp.get('ok'):
+            last_error = f"ter-music-rust load_playlist failed: {resp.get('error') or resp}"
+            continue
+        data = resp.get('data') or {}
+        current = data.get('track') or (payload_tracks[attempt_index] if payload_tracks else {})
+
+        # Verify the ffplay child is still alive after a short grace period.
+        time.sleep(0.8)
+        try:
+            st = ter_player_command({'cmd': 'status'}, timeout=3)
+            last_status = st.get('data') or st
+        except Exception as e:
+            last_error = f'ter-music-rust status after start failed: {e}'
+            last_status = None
+
+        if isinstance(last_status, dict) and last_status.get('alive') and last_status.get('playing'):
+            state = {
+                'pid': info.get('pid') or (load_mpv_state() or {}).get('pid'),
+                'playlist_id': str(playlist_id),
+                'playlist_name': playlist_name,
+                'index': int(attempt_index),
+                'track': current,
+                'started_at': time.time(),
+                'paused': False,
+                'backend': 'ter-music-rust',
+            }
+            save_mpv_state(state)
+            skipped = '' if int(attempt_index) == int(start_index or 0) else f' (skipped to index {attempt_index})'
+            return 0, f"ter-music-rust playlist loaded{skipped}: {playlist_name or playlist_id} -> {current.get('name', '')} - {current.get('artist', '')}"
+
+        last_error = f"player exited immediately after start; status={last_status}"
+        # Single-track requests should fail clearly; playlist requests can skip.
+        if len(payload_tracks) <= 1:
+            break
+
+    return 1, last_error or 'ter-music-rust load_playlist failed: no playable tracks in first attempts'
 
 
 def local_player_process_alive(pid):
@@ -1375,7 +1610,7 @@ def load_playlists():
     if data is None:
         data = json.loads(PLAYLISTS_FILE.read_text())
     if data.get('success') and data.get('playlists'):
-        return data['playlists']
+        return filter_playlists(data['playlists'])
     return None
 
 
@@ -1408,7 +1643,7 @@ def get_cached_tracks(playlist_id):
     cache = load_tracks_cache()
     entry = cache.get(str(playlist_id))
     if entry:
-        return entry.get('tracks')
+        return filter_tracks(entry.get('tracks'))
     return None
 
 
@@ -1547,14 +1782,26 @@ def match_artist_playlist(query):
     if not matches:
         # Try partial matching: query contained in artist key or vice versa
         for artist_key, pl_list in index.items():
+            if not artist_key:
+                continue
             if artist_query in artist_key or (len(artist_query) >= 3 and artist_key in artist_query):
                 matches = pl_list
                 break
         if not matches:
-            # Bigram fuzzy match against artist names
-            best_sim = 0.35
+            # Bigram fuzzy match against artist names.  Keep this conservative:
+            # compare the stripped artist text (not the full command), avoid
+            # cross-script ASCII/CJK-kana accidents, and require a strong score.
+            # Otherwise entity playlist requests like "Higher Brothers 的歌单"
+            # can be hijacked by an unrelated dominant-artist playlist.
+            query_has_alpha = any(c.isalpha() and c.isascii() for c in artist_query)
+            best_sim = 0.55
             for artist_key, pl_list in index.items():
-                sim = text_similarity(query, artist_key)
+                if not artist_key:
+                    continue
+                artist_has_alpha = any(c.isalpha() and c.isascii() for c in artist_key)
+                if query_has_alpha != artist_has_alpha:
+                    continue
+                sim = text_similarity(artist_query, artist_key)
                 if sim > best_sim:
                     best_sim = sim
                     matches = pl_list
@@ -1673,6 +1920,7 @@ LOCAL_PLAYLIST_HINTS = [
     (['工作', '写作', '码字', '学习', '专注', '论文', '看书'], ['读论文/写代码/看书专用BGM', 'Lofi hiphop • 沉浸在惬意学习时光里', '氛围自习室｜学习工作专注歌单', '学习歌单‖极静轻音乐01', '学习时听']),
     (['冥想', '瑜伽', '打坐', '禅'], ['禅.静坐.打坐.冥想.瑜伽.空灵音乐', '冥想']),
     (['运动', '跑步', '健身', '锻炼'], ['健身歌单【精神氮泵】', '健身房听的说唱']),
+    (['做爱', '性爱', '亲热', '亲密', '暧昧', '情侣', '卧室', '夜晚'], ['【情侣】适合做菜Do 的时候听的歌', '慵懒卧室——氛围感', '另类独立&CHILL歌单']),
     (['做饭', '烧饭', '煮饭', '烹饪', '厨房', 'cooking'], ['咖啡店音乐', '【情侣】适合做菜Do 的时候听的歌']),
     (['口琴'], ['口琴']),
     (['英语', '英文'], ['怀旧英语', '英文说唱']),
@@ -1715,6 +1963,35 @@ def _playlist_score_for_name(query_norm, query_core, playlist):
 
     return 0, ''
 
+
+
+def semantic_mapper_match_playlist(query, require_scene=False):
+    """Use the warmed local semantic mapper for scene/mood playlist requests.
+
+    This avoids the older hard keyword table turning phrases such as
+    "下班舒缓" into a fixed playlist, while still keeping exact alias/name
+    matching in fast_match_playlist.
+    """
+    try:
+        import semantic_playlist_mapper as sem
+        nlu = sem.analyze_query_mood(query)
+        if require_scene and nlu.get('intent') != 'scene_mood':
+            return None
+        out = sem.predict(query, top_k=3)
+        if out.get('decision') != 'local' or not out.get('top1'):
+            return None
+        top = out['top1']
+        return {
+            'playlist_id': str(top.get('playlist_id') or ''),
+            'playlist_name': top.get('playlist_name') or '',
+            'reason': f"semantic mapper: {','.join(nlu.get('moods') or [])} score={float(top.get('score') or 0):.3f}",
+            'score': int(float(top.get('score') or 0) * 1000),
+            'is_mine': bool(top.get('is_mine')),
+            'shuffle': False,
+        }
+    except Exception as e:
+        print(f'[music-agent] semantic mapper playlist match unavailable: {e}', flush=True)
+        return None
 
 def fast_match_playlist(query, playlists):
     """Return a high-confidence local playlist match without calling LLM.
@@ -1777,11 +2054,15 @@ def fast_match_playlist(query, playlists):
 
     # Intent hints for common scenarios. Use both created and favorited
     # playlists, because the user's useful scene playlists are often favorites.
+    # Do this BEFORE the slower semantic mapper so front-end play requests start
+    # quickly and never wait on embeddings/LLM for clearly curated scenes.
     by_norm_name = {norm_text(p.get('name', '')): p for p in playlists}
+    had_scene_hint = False
     for keywords, preferred_names in LOCAL_PLAYLIST_HINTS:
         hit_kw = next((kw for kw in keywords if norm_text(kw) in query_norm), None)
         if not hit_kw:
             continue
+        had_scene_hint = True
         for rank, pname in enumerate(preferred_names):
             pl = by_norm_name.get(norm_text(pname))
             if pl and int(pl.get('count') or 0) > 0:
@@ -1790,6 +2071,12 @@ def fast_match_playlist(query, playlists):
                 scene_score = 820 - rank * 22 + (25 if pl.get('is_mine') else 0)
                 candidates.append((scene_score, f'scene keyword {hit_kw}->{pname}', pl))
                 break
+
+    # Only use the slower semantic mapper when no curated scene hint fired.
+    if not had_scene_hint:
+        semantic_scene_match = semantic_mapper_match_playlist(query, require_scene=True)
+        if semantic_scene_match:
+            return semantic_scene_match
 
     if not candidates:
         return None
@@ -1904,7 +2191,7 @@ def fetch_playlist_tracks(playlist_id, force_refresh=False):
             tracks = data.get('tracks') or []
             name = data.get('name', '')
             cache_playlist_tracks(playlist_id, name, tracks)
-            return tracks
+            return filter_tracks(tracks)
     except Exception as e:
         print(f'[music-agent] playlist worker fallback for {playlist_id}: {e}', flush=True)
     script = f"""
@@ -1931,7 +2218,7 @@ else:
     tracks = data['tracks']
     name = data.get('name', '')
     cache_playlist_tracks(playlist_id, name, tracks)
-    return tracks
+    return filter_tracks(tracks)
 
 
 def try_play_tracks_with_yesplay(tracks, source_id='agent', source_type='agent', playlist_name='', shuffle=False):
@@ -1969,6 +2256,8 @@ def try_play_playlist(playlist_id, playlist_name='', shuffle=True, prefer_native
 
     if isinstance(audio, dict):
         audio = {**audio, 'cleared_queue': cleared}
+    if isinstance(audio, dict) and not audio.get('ok', False):
+        raise RuntimeError(f"preferred audio output unavailable; refusing to play through Mac speakers: {audio}")
 
     if shuffle and len(tracks) > 1:
         random.shuffle(tracks)
@@ -2135,6 +2424,10 @@ def try_play_artist_collection(query):
     if not tracks:
         return None
     shuffle = False
+    cleared = clear_native_queue()
+    audio = ensure_preferred_audio_output()
+    if isinstance(audio, dict):
+        audio = {**audio, 'cleared_queue': cleared}
     rc, out = play_ter_playlist(f'artist:{keyword}', f'{keyword} 的歌', tracks, start_index=0, shuffle=shuffle, play_mode='loop_all')
     if rc != 0:
         raise RuntimeError(f'artist collection play failed: {out}')
@@ -2148,6 +2441,7 @@ def try_play_artist_collection(query):
         'artist_query': keyword,
         'track_count': len(tracks),
         'track': first,
+        'audio_output': audio,
         'cdp_result': f'ter-music-rust artist playlist loaded: {len(tracks)} tracks; now playing: {first.get("name")} - {first.get("artist")} | {out}',
     }
 
@@ -2324,21 +2618,231 @@ def refresh_all_caches():
         time.sleep(CACHE_TRACKS_TTL)
 
 
+
+MUSIC_UI_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>局域网音乐控制台</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --card:#151b2f; --muted:#9aa4b2; --fg:#eef3ff; --accent:#73d13d; --danger:#ff7875; --btn:#26314f; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top, #1b2a4d, var(--bg)); color: var(--fg); }
+    main { max-width: 720px; margin: 0 auto; padding: 24px 16px 44px; }
+    h1 { margin: 10px 0 6px; font-size: 28px; }
+    .sub { color: var(--muted); margin-bottom: 18px; line-height: 1.5; }
+    .card { background: rgba(21,27,47,.92); border: 1px solid rgba(255,255,255,.08); border-radius: 18px; padding: 16px; box-shadow: 0 18px 50px rgba(0,0,0,.25); }
+    textarea { width:100%; min-height: 96px; resize: vertical; border: 1px solid rgba(255,255,255,.12); border-radius: 14px; background:#0f1528; color:var(--fg); padding:14px; font-size:20px; line-height:1.45; outline:none; }
+    textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(115,209,61,.18); }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+    button { appearance:none; border:0; border-radius: 14px; padding: 13px 16px; background: var(--btn); color: var(--fg); font-size: 17px; font-weight: 650; cursor:pointer; min-height:48px; }
+    button.primary { background: linear-gradient(135deg, #52c41a, #2f9e44); color:#061006; }
+    button.warn { background:#4b2530; color:#ffd6d5; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .grow { flex:1 1 180px; }
+    .quick button { font-size:15px; padding:10px 12px; min-height:40px; background:#1f2944; color:#dbe7ff; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#090e1b; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:12px; min-height:80px; color:#dbe7ff; }
+    .statusline { color: var(--muted); font-size:14px; margin-top:10px; }
+    .ok { color: var(--accent); } .bad { color: var(--danger); }
+    a { color:#91caff; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>🎵 局域网音乐控制台</h1>
+  <div class="sub">输入歌名/歌单/自然语言命令，点播放。语音按钮依赖浏览器权限；如果不可用，直接用手机键盘自带语音输入也可以。</div>
+  <section class="card">
+    <textarea id="q" placeholder="例如：陈奕迅 十年 / 下雨时听的歌 / 助眠歌单"></textarea>
+    <div class="row">
+      <button id="play" class="primary grow">▶ 播放</button>
+      <button id="voice" class="grow">🎙 语音输入</button>
+      <button id="clear">清空</button>
+    </div>
+    <div class="row quick">
+      <button data-q="kkecho歌单">随便听</button>
+      <button data-q="下雨时听的歌">下雨</button>
+      <button data-q="助眠歌单">助眠</button>
+      <button data-q="写作音乐">写作</button>
+      <button data-q="国语">国语</button>
+    </div>
+    <div class="row">
+      <button data-cmd="pause">⏸ 暂停</button>
+      <button data-cmd="resume">▶ 继续</button>
+      <button data-cmd="prev">⏮ 上一首</button>
+      <button data-cmd="next">⏭ 下一首</button>
+      <button data-cmd="status">📡 状态</button>
+    </div>
+    <div id="hint" class="statusline"></div>
+  </section>
+  <h3>返回结果</h3>
+  <pre id="out">等待命令...</pre>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const q = $('q'), out = $('out'), hint = $('hint');
+function setOut(obj, ok=true) {
+  out.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+  hint.innerHTML = ok ? '<span class="ok">完成</span>' : '<span class="bad">失败</span>';
+}
+async function fetchJson(path, timeoutMs=0) {
+  // 播放/歌单请求可能要：连蓝牙音箱、切音频输出、拉歌单/URL、启动本地播放器。
+  // 旧版 12s 强制 abort 会让手机端只看到 “signal is aborted without reason”，
+  // 同时后端继续执行到写回时 BrokenPipe。默认不主动 abort；只在明确传 timeoutMs 时超时。
+  const ctrl = timeoutMs > 0 ? new AbortController() : null;
+  const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort('timeout after ' + timeoutMs + 'ms'), timeoutMs) : null;
+  try {
+    const r = await fetch(path, {cache:'no-store', signal: ctrl ? ctrl.signal : undefined});
+    let data;
+    try { data = await r.json(); } catch (e) { data = {ok:false, error:String(e)}; }
+    data.__http_ok = r.ok;
+    return data;
+  } catch (e) {
+    const msg = (e && (e.name === 'AbortError' || String(e).includes('aborted')))
+      ? ('请求超时/被浏览器取消：' + (ctrl && ctrl.signal && ctrl.signal.reason ? ctrl.signal.reason : String(e)))
+      : String(e);
+    return {ok:false, __http_ok:false, error:msg};
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+let busy = false;
+async function call(path, timeoutMs=0) {
+  hint.textContent = '执行中...';
+  const data = await fetchJson(path, timeoutMs);
+  setOut(data, data.__http_ok && data.ok !== false);
+  return data;
+}
+function isPlayingStatus(data) {
+  return !!(data && data.ok && data.status && data.status.playing);
+}
+async function playAndEnsure(text) {
+  hint.textContent = '播放中...';
+  const steps = [];
+  let data = await fetchJson('/play?q=' + encodeURIComponent(text), 120000);
+  steps.push({step:'play requested', data});
+  if (!(data.__http_ok && data.ok !== false)) {
+    setOut({ok:false, requested:text, error:data.error || 'play request failed', steps}, false);
+    return;
+  }
+  await new Promise(r => setTimeout(r, 1200));
+  let st = await fetchJson('/status');
+  steps.push({step:'status after play', data:st});
+  if (!isPlayingStatus(st)) {
+    const rs = await fetchJson('/resume');
+    steps.push({step:'resume attempted', data:rs});
+    await new Promise(r => setTimeout(r, 900));
+    st = await fetchJson('/status');
+    steps.push({step:'status after resume', data:st});
+  }
+  if (!isPlayingStatus(st) && text !== 'kkecho歌单') {
+    const fb = await fetchJson('/play?q=' + encodeURIComponent('kkecho歌单'), 120000);
+    steps.push({step:'fallback playlist', data:fb});
+    await new Promise(r => setTimeout(r, 1200));
+    st = await fetchJson('/status');
+    steps.push({step:'status after fallback', data:st});
+  }
+  const ok = isPlayingStatus(st);
+  setOut({ok, requested:text, final_status:st.status || st, steps}, ok);
+}
+$('play').onclick = async () => {
+  const text = q.value.trim();
+  if (!text) { q.focus(); hint.innerHTML = '<span class="bad">先输入内容</span>'; return; }
+  if (busy) { hint.textContent = '上一条播放命令还在执行，请稍等...'; return; }
+  busy = true;
+  $('play').disabled = true;
+  try { await playAndEnsure(text); }
+  finally { busy = false; $('play').disabled = false; }
+};
+$('clear').onclick = () => { q.value=''; q.focus(); };
+document.querySelectorAll('[data-cmd]').forEach(b => b.onclick = () => {
+  const cmd = b.dataset.cmd;
+  call(cmd === 'status' ? '/status' : '/' + cmd);
+});
+document.querySelectorAll('[data-q]').forEach(b => b.onclick = () => { q.value = b.dataset.q; $('play').click(); });
+q.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') $('play').click(); });
+
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false;
+if (!SpeechRecognition) {
+  $('voice').disabled = true;
+  $('voice').textContent = '🎙 浏览器不支持';
+  hint.innerHTML = '提示：可点输入框，用手机输入法自带麦克风。';
+} else {
+  rec = new SpeechRecognition();
+  rec.lang = 'zh-CN'; rec.interimResults = true; rec.continuous = false;
+  rec.onstart = () => { listening = true; $('voice').textContent = '🛑 停止收音'; hint.textContent = '正在听...'; };
+  rec.onend = () => { listening = false; $('voice').textContent = '🎙 语音输入'; };
+  rec.onerror = (e) => { setOut('语音输入失败：' + e.error + '\n如果是权限/HTTPS问题，请用文字框或手机键盘语音。', false); };
+  rec.onresult = (e) => {
+    let text = '';
+    for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
+    q.value = text.trim();
+    if (e.results[e.results.length - 1].isFinal) hint.textContent = '已识别，可点播放';
+  };
+  $('voice').onclick = () => { try { listening ? rec.stop() : rec.start(); } catch(e) { setOut(String(e), false); } };
+}
+call('/health');
+</script>
+</body>
+</html>"""
+
+class FastThreadingHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # Avoid HTTPServer.server_bind() reverse-DNS lookup on 0.0.0.0,
+        # which can block startup for a long time on some LAN/DNS setups.
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _write_response(self, code, content_type, body):
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # 手机浏览器/旧前端主动 abort 后，后端可能已经完成了慢播放操作。
+            # 这不是服务端故障，静默记录，避免误导下一次排障。
+            print(f'[music-agent] client disconnected before response: {self.client_address[0]} {e}', flush=True)
+
+    def html(self, code, text):
+        self._write_response(code, 'text/html; charset=utf-8', text.encode('utf-8'))
+
     def json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_response(code, 'application/json; charset=utf-8', json.dumps(obj, ensure_ascii=False).encode('utf-8'))
 
     def do_GET(self):
         u = urlparse(self.path)
         qs = parse_qs(u.query)
         try:
+            if u.path in ('/', '/ui'):
+                self.html(200, render_music_ui_html())
+                return
+            if u.path == '/suggestions':
+                self.json(200, {'ok': True, **build_suggestions()})
+                return
             if u.path == '/health':
                 self.json(200, {'ok': True})
+                return
+            if u.path == '/playlist':
+                playlist_id = (qs.get('id') or [''])[0].strip()
+                if not playlist_id:
+                    self.json(400, {'ok': False, 'error': 'missing id'})
+                    return
+                playlists = load_playlists() or []
+                match = next((p for p in playlists if str(p.get('id')) == playlist_id), None)
+                if not match:
+                    self.json(404, {'ok': False, 'error': f'playlist {playlist_id} not found'})
+                    return
+                playlist_name = playlist_title(match)
+                orpheus_url, cdp_result = try_play_playlist(playlist_id, playlist_name)
+                self.json(200, {'ok': True, 'action': 'playlist', 'source': 'random_console', 'playlist_id': playlist_id, 'playlist_name': playlist_name, 'orpheus_url': orpheus_url, 'cdp_result': cdp_result})
                 return
             if u.path == '/ask':
                 q = (qs.get('q') or [''])[0].strip()
@@ -2581,10 +3085,11 @@ class Handler(BaseHTTPRequestHandler):
                 backend = state.get('backend') or 'ter-music-rust'
                 if backend == 'ter-music-rust':
                     try:
+                        native_guard = pause_native_netease_best_effort()
                         req = {'cmd': 'pause' if cmd == 'pause' else ('next' if cmd == 'next' else 'prev')}
                         resp = ter_player_command(req, timeout=30)
                         ok = bool(resp.get('ok'))
-                        self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'player': 'ter-music-rust', 'queue': True, 'output': resp.get('data') or resp})
+                        self.json(200 if ok else 500, {'ok': ok, 'action': cmd, 'player': 'ter-music-rust', 'queue': True, 'single_source_guard': {'native_netease': native_guard}, 'output': resp.get('data') or resp})
                     except Exception as e:
                         self.json(500, {'ok': False, 'action': cmd, 'player': 'ter-music-rust', 'error': str(e)})
                     return
@@ -2598,9 +3103,28 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     resp = ter_player_command({'cmd': 'resume'}, timeout=10)
                     ok = bool(resp.get('ok'))
-                    self.json(200 if ok else 500, {'ok': ok, 'action': 'resume', 'player': 'ter-music-rust', 'output': resp.get('data') or resp})
+                    data = resp.get('data') or {}
+                    revived = None
+                    if ok and isinstance(data, dict) and not data.get('playing'):
+                        state = load_mpv_state() or {}
+                        t = state.get('track') or {}
+                        replay_q = ' '.join([str(t.get('artist') or '').strip(), str(t.get('name') or '').strip()]).strip() or 'kkecho歌单'
+                        rc, out, audio = run_play_query(replay_q)
+                        revived = {'q': replay_q, 'ok': rc == 0, 'output': out, 'audio_output': audio}
+                        if rc == 0:
+                            try:
+                                resp2 = ter_player_command({'cmd': 'status'}, timeout=3)
+                                data = resp2.get('data') or data
+                                ok = bool(resp2.get('ok'))
+                            except Exception:
+                                pass
+                    self.json(200 if ok else 500, {'ok': ok, 'action': 'resume', 'player': 'ter-music-rust', 'output': data or resp, 'revived': revived})
                 except Exception as e:
-                    self.json(500, {'ok': False, 'action': 'resume', 'player': 'ter-music-rust', 'error': str(e)})
+                    try:
+                        rc, out, audio = run_play_query('kkecho歌单')
+                        self.json(200 if rc == 0 else 500, {'ok': rc == 0, 'action': 'resume', 'player': 'ter-music-rust', 'fallback': 'kkecho歌单', 'output': out, 'audio_output': audio, 'previous_error': str(e)})
+                    except Exception as e2:
+                        self.json(500, {'ok': False, 'action': 'resume', 'player': 'ter-music-rust', 'error': str(e), 'fallback_error': str(e2)})
                 return
             if u.path == '/seek':
                 try:
@@ -2631,10 +3155,16 @@ class Handler(BaseHTTPRequestHandler):
             self.json(500, {'ok': False, 'error': str(e)})
 
     def log_message(self, fmt, *args):
-        print('[music-agent]', self.address_string(), fmt % args, flush=True)
+        print('[music-agent]', self.client_address[0], fmt % args, flush=True)
 
 
 if __name__ == '__main__':
+    port = int(os.environ.get('MUSIC_AGENT_PORT', '8765'))
+    host = os.environ.get('MUSIC_AGENT_HOST', '0.0.0.0')
+    server = FastThreadingHTTPServer((host, port), Handler)
+    print(f'music-agent listening on http://{host}:{port}', flush=True)
+    # Start warm-up/background work only after the socket is bound, so the
+    # control console is reachable immediately after launchctl restarts it.
     threading.Thread(target=refresh_all_caches, daemon=True).start()
     threading.Thread(target=warm_netease_worker, daemon=True).start()
     threading.Thread(target=warm_semantic_playlist_mapper, daemon=True).start()
@@ -2645,7 +3175,4 @@ if __name__ == '__main__':
             idx = build_artist_index()
             print(f'[music-agent] startup artist index built: {len(idx)} artists', flush=True)
         threading.Thread(target=_build_index_startup, daemon=True).start()
-    port = int(os.environ.get('MUSIC_AGENT_PORT', '8765'))
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-    print(f'music-agent listening on http://127.0.0.1:{port}', flush=True)
     server.serve_forever()

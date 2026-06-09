@@ -1,9 +1,5 @@
 import asyncio
-import os
 import requests
-
-
-MUSIC_AGENT_URL = os.environ.get('MUSIC_AGENT_URL', 'http://127.0.0.1:8765').rstrip('/')
 
 
 async def _suppress_xiaoai(did, reason=''):
@@ -38,7 +34,7 @@ async def smartask(query):
         return
 
     try:
-        r = requests.get(f'{MUSIC_AGENT_URL}/ask', params={'q': q}, timeout=60)
+        r = requests.get('http://127.0.0.1:8765/ask', params={'q': q}, timeout=60)
         r.raise_for_status()
         data = r.json()
         answer = (data.get('answer') or '').strip() or '我没有得到有效回答。'

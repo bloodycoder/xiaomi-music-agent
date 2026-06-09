@@ -9,6 +9,11 @@ import os
 import re
 import time
 from pathlib import Path
+try:
+    from music_disable_rules import filter_playlists
+except Exception:
+    def filter_playlists(playlists, rules=None):
+        return list(playlists or [])
 
 ROOT = Path(os.environ.get('XIAOMI_MUSIC_ROOT', Path.home() / 'xiaomi-music')).expanduser()
 PLAYLISTS_FILE = ROOT / 'runtime' / 'playlists.json'
@@ -149,7 +154,7 @@ def build_aliases_for_playlist(pl):
 
 def main():
     data = json.loads(PLAYLISTS_FILE.read_text())
-    playlists = data.get('playlists') or []
+    playlists = filter_playlists(data.get('playlists') or [])
     out = {
         'version': 1,
         'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
